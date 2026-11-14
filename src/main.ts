@@ -13,6 +13,8 @@ import { migrate } from './migrate.ts';
 import { createApp } from './server.ts';
 import { SessionStore } from './session.ts';
 import { PgLedger } from './store.ts';
+import { PgDraftStore } from './drafts.ts';
+import { AnthropicPathDrafter } from './llm.ts';
 
 const config = loadConfig();
 
@@ -33,10 +35,24 @@ const restored = await sessions.load();
 const ledger = new PgLedger(pool);
 const auth = new AuthService({ config, sessions });
 
+// The drafter is optional: without a LiteLLM key the app still serves the
+// Today screen, it just cannot propose listings.
+const drafts = new PgDraftStore(pool);
+const drafter = config.llmApiKey
+  ? new AnthropicPathDrafter({
+      baseUrl: config.llmBaseUrl,
+      apiKey: config.llmApiKey,
+      model: config.llmModel,
+    })
+  : undefined;
+
 const { server } = createApp({
   // The Postgres store implements the same contract as the in-memory ledger.
   ledger: ledger as unknown as Ledger,
   verifySession: (token) => sessions.verify(token),
+  drafts,
+  ...(drafter ? { drafter } : {}),
+  photosDir: config.photosDir,
   auth: {
     begin: () => auth.begin(),
     complete: (params) => auth.complete(params),

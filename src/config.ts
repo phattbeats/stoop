@@ -18,6 +18,14 @@ export interface Config {
   sessionTtlMinutes: number;
   /** HMAC key for the short-lived login-state cookie. */
   sessionSecret: string;
+  /** LiteLLM base URL for the Anthropic-path drafter. */
+  llmBaseUrl: string;
+  /** LiteLLM key for the drafter. Empty means the drafter is unavailable. */
+  llmApiKey: string;
+  /** Anthropic model id, e.g. anthropic/claude-sonnet-5. */
+  llmModel: string;
+  /** Where Emily's photos live on the box. */
+  photosDir: string;
 }
 
 function required(name: string): string {
@@ -46,5 +54,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     databaseUrl: required('STOOP_DATABASE_URL'),
     sessionTtlMinutes: Number(optional('STOOP_SESSION_TTL_MINUTES', '480')),
     sessionSecret: required('STOOP_SESSION_SECRET'),
+    llmBaseUrl: optional('STOOP_LLM_BASE_URL', 'http://10.0.0.100:4000').replace(/\/$/, ''),
+    llmApiKey: optional('STOOP_LLM_API_KEY', ''),
+    llmModel: optional('STOOP_LLM_MODEL', 'anthropic/claude-sonnet-5'),
+    photosDir: optional('STOOP_PHOTOS_DIR', '/srv/appdata/stoop/photos'),
   };
 }

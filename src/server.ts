@@ -11,9 +11,24 @@
  */
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { basename, join, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { Ledger, type Marketplace } from './ledger.ts';
 import { renderShell, type TodayItem } from './ui.ts';
 import { AUTH_STATE_COOKIE, SESSION_COOKIE, serializeCookie } from './session.ts';
+import {
+  approveDraft,
+  draftView,
+  eligibleMarketplaces,
+  makeDraft,
+  rejectDraft,
+  reviewProposal,
+  type ListingDraft,
+} from './draft.ts';
+import type { DraftStore } from './drafts.ts';
+import type { DraftPhoto, DraftRequest } from './llm.ts';
+import { DraftingError } from './llm.ts';
 
 export interface Session {
   authUserId: string;
@@ -27,6 +42,17 @@ export interface ServerOptions {
   verifySession: SessionVerifier;
   /** PHATT ID login. Without it the app has no way in. */
   auth?: AuthHooks;
+  /** Draft storage. Without it the drafter has nowhere to put a proposal. */
+  drafts?: DraftStore;
+  /** The model call. Anthropic path only (src/llm.ts). */
+  drafter?: Drafter;
+  /** Where Emily's photos live on the box. */
+  photosDir?: string;
+}
+
+/** The seam the drafter sits behind, so tests never call a model. */
+export interface Drafter {
+  propose(request: DraftRequest): Promise<unknown>;
 }
 
 export interface AuthHooks {
@@ -42,6 +68,57 @@ export interface AuthHooks {
 }
 
 const MARKETPLACES: Marketplace[] = ['ebay', 'etsy', 'facebook'];
+
+const MEDIA_TYPES: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.heic': 'image/heic',
+};
+
+/**
+ * Turn what Emily sent into images the model can see.
+ *
+ * Three shapes are accepted: an http(s) URL (passed through), a data URL or
+ * raw base64, or a path under the photos directory on the box — which we read
+ * here and inline, because the model cannot read our filesystem.
+ */
+async function resolvePhotos(
+  input: unknown,
+  photosDir: string,
+): Promise<{ photos: DraftPhoto[]; refs: string[] }> {
+  const raw = Array.isArray(input) ? input : [];
+  const photos: DraftPhoto[] = [];
+  const refs: string[] = [];
+
+  for (const entry of raw.slice(0, 6)) {
+    const ref = typeof entry === 'string' ? entry : (entry as Record<string, unknown>)?.ref;
+    if (typeof ref !== 'string' || !ref.trim()) continue;
+    const trimmed = ref.trim();
+    refs.push(trimmed);
+
+    if (/^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) {
+      photos.push({ ref: trimmed });
+      continue;
+    }
+
+    // A path on the box: read it, inline it, and refuse to leave the root.
+    const root = resolve(photosDir);
+    const full = resolve(root, trimmed.replace(/^\/+/, ''));
+    if (full !== root && !full.startsWith(`${root}/`)) {
+      throw new Error('photo path is outside the photos directory');
+    }
+    const bytes = await readFile(full);
+    const mediaType =
+      MEDIA_TYPES[basename(full).toLowerCase().slice(basename(full).toLowerCase().lastIndexOf('.'))] ??
+      'image/jpeg';
+    photos.push({ ref: bytes.toString('base64'), mediaType });
+  }
+
+  return { photos, refs };
+}
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -74,6 +151,43 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
+async function readRaw(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Save what Emily's phone uploaded into the photos directory.
+ *
+ * The file name is ours, not hers: a UUID and the type's extension. Nothing
+ * from the client can steer the path.
+ */
+async function saveUploads(form: FormData, photosDir: string): Promise<string[]> {
+  const saved: string[] = [];
+  const root = resolve(photosDir);
+  for (const entry of form.getAll('photo')) {
+    if (typeof entry === 'string') continue;
+    if (!entry || typeof (entry as File).arrayBuffer !== 'function') continue;
+    const file = entry as File;
+    if (!file.size) continue;
+    const ext =
+      ({
+        'image/jpeg': 'jpg',
+        'image/png': 'png',
+        'image/webp': 'webp',
+        'image/gif': 'gif',
+        'image/heic': 'heic',
+      })[file.type] ?? 'jpg';
+    const name = `${randomUUID()}.${ext}`;
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, name), Buffer.from(await file.arrayBuffer()));
+    saved.push(name);
+    if (saved.length >= 6) break;
+  }
+  return saved;
+}
+
 function itemView(item: ReturnType<Ledger['createItem']>): Record<string, unknown> {
   return {
     id: item.id,
@@ -94,6 +208,9 @@ export function createApp(options: ServerOptions): {
   const ledger = options.ledger ?? new Ledger();
   const verifySession = options.verifySession;
   const auth = options.auth;
+  const drafts = options.drafts;
+  const drafter = options.drafter;
+  const photosDir = options.photosDir ?? '/srv/appdata/stoop/photos';
 
   const sellerFor = async (session: Session): Promise<string> => {
     const allItems = await ledger.listItems();
@@ -199,7 +316,23 @@ export function createApp(options: ServerOptions): {
             };
           }),
         );
-        const html = renderShell({ displayName: session.displayName, items });
+        const pending = drafts
+          ? (await drafts.listForSeller(sellerId)).filter((draft) => draft.status === 'draft')
+          : [];
+        const html = renderShell({
+          displayName: session.displayName,
+          items,
+          drafts: pending.map((draft) => ({
+            id: draft.id,
+            title: draft.title,
+            priceRange: draft.priceRange,
+            tags: draft.tags,
+            shipping: draft.shipping,
+            flags: draft.flags,
+            confidence: draft.confidence,
+            notes: draft.notes,
+          })),
+        });
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
@@ -301,12 +434,172 @@ export function createApp(options: ServerOptions): {
           return;
         }
 
+        // ── The listing drafter (PHA-5095) ────────────────────────────────────
+        // Photograph it, the model proposes, Emily approves. The model never
+        // publishes anything; it only ever produces a draft.
+
+        if (req.method === 'POST' && url.pathname === '/api/drafts') {
+          if (!drafts || !drafter) {
+            json(res, 501, { error: 'drafter_unavailable' });
+            return;
+          }
+          const contentType = String(req.headers['content-type'] ?? '');
+          let photosInput: unknown = [];
+          let notes = '';
+          let hints: string[] = [];
+          let marketplaces: string[] = [];
+          let priceHint: string | undefined;
+
+          if (contentType.includes('multipart/form-data')) {
+            // Emily's phone: a photo, optionally with a note typed alongside it.
+            const raw = await readRaw(req);
+            const form = await new Response(new Uint8Array(raw), { headers: { 'content-type': contentType } }).formData();
+            const notesField = form.get('notes');
+            notes = typeof notesField === 'string' ? notesField.trim().slice(0, 4000) : '';
+            const marketplacesField = form.get('marketplaces');
+            if (typeof marketplacesField === 'string') {
+              marketplaces = marketplacesField
+                .split(',')
+                .map((m) => m.trim())
+                .filter(Boolean)
+                .slice(0, 3);
+            }
+            photosInput = await saveUploads(form, photosDir);
+          } else {
+            const body = await readJson(req);
+            photosInput = body.photos;
+            notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 4000) : '';
+            hints = Array.isArray(body.hints)
+              ? body.hints.filter((hint): hint is string => typeof hint === 'string').slice(0, 12)
+              : [];
+            marketplaces = Array.isArray(body.marketplaces)
+              ? (body.marketplaces as unknown[])
+                  .filter((m): m is string => typeof m === 'string')
+                  .slice(0, 3)
+              : [];
+            priceHint = typeof body.priceHint === 'string' ? body.priceHint.slice(0, 80) : undefined;
+          }
+
+          const photos = await resolvePhotos(photosInput, photosDir);
+          if (photos.photos.length === 0) {
+            json(res, 400, { error: 'photos_required' });
+            return;
+          }
+
+          const proposed = await drafter.propose({
+            photos: photos.photos,
+            notes,
+            hints,
+            marketplaces,
+            ...(priceHint ? { priceHint } : {}),
+          });
+          const review = reviewProposal(proposed);
+          if (!review.usable) {
+            json(res, 422, { error: 'draft_unusable', problems: review.problems });
+            return;
+          }
+
+          const draft = makeDraft({
+            id: randomUUID(),
+            sellerId,
+            proposal: review.proposal,
+            photos: photos.refs,
+            notes,
+            now: new Date().toISOString(),
+          });
+          await drafts.create(draft);
+          json(res, 201, {
+            draft: draftView(draft),
+            marketplaces: eligibleMarketplaces(draft),
+            corrections: review.corrections,
+          });
+          return;
+        }
+
+        // GET /api/drafts — what is waiting on Emily
+        if (req.method === 'GET' && url.pathname === '/api/drafts') {
+          if (!drafts) {
+            json(res, 501, { error: 'drafter_unavailable' });
+            return;
+          }
+          const all = await drafts.listForSeller(sellerId);
+          const pending = all.filter((draft) => draft.status === 'draft');
+          const decided = all.filter((draft) => draft.status !== 'draft');
+          json(res, 200, {
+            drafts: [...pending, ...decided].map((draft) => ({
+              ...draftView(draft),
+              marketplaces: eligibleMarketplaces(draft),
+            })),
+          });
+          return;
+        }
+
+        // POST /api/drafts/:id/approve — Emily says yes; the item record exists
+        const approveMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/approve$/);
+        if (req.method === 'POST' && approveMatch) {
+          if (!drafts) {
+            json(res, 501, { error: 'drafter_unavailable' });
+            return;
+          }
+          const draft = await drafts.get(approveMatch[1]);
+          if (!draft || draft.sellerId !== sellerId) {
+            json(res, 404, { error: 'draft_not_found' });
+            return;
+          }
+          const body = await readJson(req);
+          const priceRaw = body.priceCents;
+          const outcome = approveDraft(
+            draft,
+            {
+              ...(priceRaw === undefined || priceRaw === null ? {} : { priceCents: Number(priceRaw) }),
+              ...(typeof body.title === 'string' ? { title: body.title } : {}),
+              ...(typeof body.description === 'string' ? { description: body.description } : {}),
+              ...(Array.isArray(body.tags) ? { tags: body.tags.filter((t): t is string => typeof t === 'string') } : {}),
+            },
+            new Date().toISOString(),
+          );
+          const item = await ledger.createItem({
+            sellerId,
+            title: outcome.item.title,
+            description: outcome.item.description,
+            priceCents: outcome.item.priceCents,
+            photos: outcome.item.photos,
+            tags: outcome.item.tags,
+          });
+          outcome.draft.itemId = item.id;
+          await drafts.save(outcome.draft);
+          json(res, 200, { draft: draftView(outcome.draft), item: itemView(item) });
+          return;
+        }
+
+        // POST /api/drafts/:id/reject — Emily says no; nothing is created
+        const rejectMatch = url.pathname.match(/^\/api\/drafts\/([^/]+)\/reject$/);
+        if (req.method === 'POST' && rejectMatch) {
+          if (!drafts) {
+            json(res, 501, { error: 'drafter_unavailable' });
+            return;
+          }
+          const draft = await drafts.get(rejectMatch[1]);
+          if (!draft || draft.sellerId !== sellerId) {
+            json(res, 404, { error: 'draft_not_found' });
+            return;
+          }
+          const rejected = rejectDraft(draft, new Date().toISOString());
+          await drafts.save(rejected);
+          json(res, 200, { draft: draftView(rejected) });
+          return;
+        }
+
         json(res, 404, { error: 'not_found' });
         return;
       }
 
       json(res, 404, { error: 'not_found' });
     } catch (error) {
+      if (error instanceof DraftingError) {
+        json(res, 502, { error: 'drafting_failed', detail: error.detail });
+        return;
+      }
       json(res, 400, { error: 'bad_request', detail: String((error as Error).message ?? error) });
     }
   });
