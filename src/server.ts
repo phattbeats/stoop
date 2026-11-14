@@ -39,6 +39,7 @@ import { DraftingError } from './llm.ts';
 import { EtsyError, EtsyPolicyError } from './etsy.ts';
 import { EBayError, EBayPolicyError } from './ebay-client.ts';
 import type { EBayService } from './ebay-service.ts';
+import type { EBayOrderSync } from './ebay-orders.ts';
 import type { MarketplaceAdapter, PublishImage } from './adapter.ts';
 import { EtsyDeliveryError, type EtsyService } from './etsy-service.ts';
 import type { RemoteActionStore } from './etsy-store.ts';
@@ -74,6 +75,8 @@ export interface ServerOptions {
   ebay?: MarketplaceAdapter;
   /** The eBay consent flow. Emily connects her own account. */
   ebayService?: EBayService;
+  /** The eBay sale sync: polls eBay for orders and ends the other listings. */
+  ebaySync?: EBayOrderSync;
   /** The queue of remote actions a human may have to finish by hand. */
   remoteActions?: RemoteActionStore;
   /** Ends the other channels' listings when an item sells. */
@@ -293,6 +296,7 @@ export function createApp(options: ServerOptions): {
   const etsy = options.etsy;
   const ebay = options.ebay;
   const ebayService = options.ebayService;
+  const ebaySync = options.ebaySync;
   const remoteActions = options.remoteActions;
   const delist = options.delist;
   const sessionSecret = options.sessionSecret;
@@ -593,6 +597,28 @@ export function createApp(options: ServerOptions): {
           }
           res.writeHead(302, { location: '/' });
           res.end();
+          return;
+        }
+
+        // POST /api/ebay/sync — poll eBay for sales now, without waiting for
+        // the loop. The phone is how Emily notices a sale, so the button
+        // has to work even if the poll is asleep.
+        if (req.method === 'POST' && url.pathname === '/api/ebay/sync') {
+          if (!ebaySync) {
+            json(res, 503, { error: 'ebay_not_configured' });
+            return;
+          }
+          try {
+            const result = await ebaySync.sync();
+            json(res, 200, { sync: result });
+          } catch (error) {
+            if (error instanceof EBayPolicyError && error.code === 'ebay_not_connected') {
+              json(res, 409, { error: 'ebay_not_connected', detail: error.message });
+              return;
+            }
+            json(res, 502, { error: 'ebay_sync_failed', detail: String((error as Error).message ?? error) });
+            return;
+          }
           return;
         }
 

@@ -20,6 +20,7 @@ import { EBayAdapter } from './ebay.ts';
 import { EBayClient } from './ebay-client.ts';
 import { EBayService } from './ebay-service.ts';
 import { EBayTokenManager, PgEBayTokenStore } from './ebay-store.ts';
+import { EBayOrderSync, type EBaySaleLedger } from './ebay-orders.ts';
 import { EtsyService } from './etsy-service.ts';
 import type { EtsySaleLedger } from './etsy-service.ts';
 import { EtsyTokenManager, PgEtsyTokenStore, PgRemoteActionStore } from './etsy-store.ts';
@@ -66,6 +67,7 @@ const remoteActions = new PgRemoteActionStore(pool);
 const adapters: Partial<Record<Marketplace, MarketplaceAdapter>> = {};
 let etsyService: EtsyService | undefined;
 let ebayService: EBayService | undefined;
+let ebaySync: EBayOrderSync | undefined;
 
 // ── eBay (PHA-5093) ──────────────────────────────────────────────────────────
 //
@@ -107,6 +109,16 @@ if (config.ebay) {
     environment: config.ebay.environment,
     redirectUri: config.ebay.redirectUri,
     scope: config.ebay.scope,
+  });
+
+  // The sale sync: eBay has no seller-side sale webhook Stoop can rely on,
+  // so Stoop polls. The join is the seller SKU, which is why the SKU is
+  // derived from Stoop's own item id.
+  ebaySync = new EBayOrderSync({
+    client,
+    ledger: ledger as unknown as EBaySaleLedger,
+    delist: new DelistRunner(remoteActions, adapters),
+    tokens: tokenManager,
   });
 }
 
@@ -161,6 +173,7 @@ const { server } = createApp({
   ...(etsyService ? { etsy: etsyService } : {}),
   ...(adapters.ebay ? { ebay: adapters.ebay } : {}),
   ...(ebayService ? { ebayService } : {}),
+  ...(ebaySync ? { ebaySync } : {}),
   remoteActions,
   delist: new DelistRunner(remoteActions, adapters),
   sessionSecret: config.sessionSecret,
@@ -192,3 +205,46 @@ const prune = setInterval(() => {
   void sessions.prune().catch(() => undefined);
 }, 15 * 60 * 1000);
 prune.unref();
+
+// ── The eBay sale poll ───────────────────────────────────────────────────────
+//
+// eBay has no seller-side sale webhook Stoop can rely on, so Stoop polls for
+// orders. Five minutes is often enough for a handful of prints and is cheap
+// enough to leave running. The phone has a button for the impatient case.
+//
+// A poll that fails is logged and retried on the next tick. It is never
+// fatal: an unreachable eBay must not take the app down with it.
+
+const EBAY_POLL_MS = 5 * 60 * 1000;
+
+if (ebaySync) {
+  let polling = false;
+  const poll = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const result = await ebaySync.sync();
+      if (result.salesRecorded > 0 || result.unmatchedLines > 0) {
+        console.log(
+          `ebay poll: sales=${result.salesRecorded} duplicates=${result.duplicates} ` +
+            `unmatched=${result.unmatchedLines} ended=${result.endedListings} needsHuman=${result.needsHuman}`,
+        );
+      }
+    } catch (error) {
+      const message = String((error as Error).message ?? error);
+      // "not connected" is the normal state before Emily consents, so it is
+      // not worth a log line every five minutes.
+      if (!message.includes('not connected')) {
+        console.log(`ebay poll failed: ${message}`);
+      }
+    } finally {
+      polling = false;
+    }
+  };
+
+  const timer = setInterval(() => void poll(), EBAY_POLL_MS);
+  timer.unref();
+  // One poll shortly after boot, so a restart picks up a sale that happened
+  // while the app was down.
+  setTimeout(() => void poll(), 10_000).unref();
+}
