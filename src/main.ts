@@ -8,13 +8,19 @@
 import { Pool } from 'pg';
 import { AuthService } from './auth.ts';
 import { loadConfig } from './config.ts';
-import type { Ledger } from './ledger.ts';
+import type { Ledger, Marketplace } from './ledger.ts';
 import { migrate } from './migrate.ts';
 import { createApp } from './server.ts';
 import { SessionStore } from './session.ts';
 import { PgLedger } from './store.ts';
 import { PgDraftStore } from './drafts.ts';
 import { AnthropicPathDrafter } from './llm.ts';
+import { EtsyAdapter, EtsyClient } from './etsy.ts';
+import { EtsyService } from './etsy-service.ts';
+import type { EtsySaleLedger } from './etsy-service.ts';
+import { EtsyTokenManager, PgEtsyTokenStore, PgRemoteActionStore } from './etsy-store.ts';
+import { DelistRunner } from './sync.ts';
+import type { MarketplaceAdapter } from './adapter.ts';
 
 const config = loadConfig();
 
@@ -46,6 +52,57 @@ const drafter = config.llmApiKey
     })
   : undefined;
 
+// ── Etsy (PHA-5096) ──────────────────────────────────────────────────────────
+//
+// Optional: without credentials the app still serves the Today screen and
+// the Facebook card. Emily's Etsy account is hers to connect, so nothing
+// here pretends to be connected until it really is.
+
+const remoteActions = new PgRemoteActionStore(pool);
+const adapters: Partial<Record<Marketplace, MarketplaceAdapter>> = {};
+let etsyService: EtsyService | undefined;
+
+if (config.etsy) {
+  const client = new EtsyClient({
+    apiKey: config.etsy.apiKey,
+    clientSecret: config.etsy.clientSecret,
+  });
+  const tokenStore = new PgEtsyTokenStore(pool);
+  const tokenManager = new EtsyTokenManager(client, tokenStore);
+  const adapter = new EtsyAdapter(
+    client,
+    tokenManager,
+    {
+      shopId: config.etsy.shopId || (async () => (await tokenStore.first())?.shopId ?? ''),
+      ...(config.etsy.taxonomyId ? { defaultTaxonomyId: config.etsy.taxonomyId } : {}),
+      ...(config.etsy.shippingProfileId ? { defaultShippingProfileId: config.etsy.shippingProfileId } : {}),
+      defaultWhoMade: config.etsy.whoMade,
+      defaultWhenMade: config.etsy.whenMade,
+    },
+  );
+  adapters.etsy = adapter;
+
+  const delist = new DelistRunner(remoteActions, adapters);
+  etsyService = new EtsyService(
+    {
+      client,
+      adapter,
+      tokenStore,
+      tokenManager,
+      webhookSecrets: config.etsy.webhookSecrets,
+      shopId: config.etsy.shopId,
+      taxonomyId: config.etsy.taxonomyId,
+      shippingProfileId: config.etsy.shippingProfileId,
+      whoMade: config.etsy.whoMade,
+      whenMade: config.etsy.whenMade,
+      scope: config.etsy.scope,
+      redirectUri: config.etsy.redirectUri,
+    },
+    ledger as unknown as EtsySaleLedger,
+    delist,
+  );
+}
+
 const { server } = createApp({
   // The Postgres store implements the same contract as the in-memory ledger.
   ledger: ledger as unknown as Ledger,
@@ -53,6 +110,10 @@ const { server } = createApp({
   drafts,
   ...(drafter ? { drafter } : {}),
   photosDir: config.photosDir,
+  ...(etsyService ? { etsy: etsyService } : {}),
+  remoteActions,
+  delist: new DelistRunner(remoteActions, adapters),
+  sessionSecret: config.sessionSecret,
   auth: {
     begin: () => auth.begin(),
     complete: (params) => auth.complete(params),

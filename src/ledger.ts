@@ -195,6 +195,19 @@ export class Ledger {
   }
 
   /**
+   * The listing that a marketplace told us about.
+   *
+   * A sale arrives naming a remote id (an Etsy listing id), not one of ours,
+   * so this is how a marketplace event finds the item it belongs to.
+   */
+  findListingByRemoteId(marketplace: Marketplace, remoteId: string): Listing | undefined {
+    for (const listing of this.listings.values()) {
+      if (listing.marketplace === marketplace && listing.remoteId === remoteId) return listing;
+    }
+    return undefined;
+  }
+
+  /**
    * Publish (or revise) the item on one marketplace.
    *
    * eBay Inventory-API listings cannot be revised in Seller Hub, so the API is the

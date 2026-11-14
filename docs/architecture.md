@@ -95,6 +95,79 @@ moved even though the item did not.
 publishes to. eBay Inventory-API listings cannot be revised in Seller Hub, so the record they were
 published from has to stay true — the same reason the draft→approve→publish flow exists at all.
 
+## The Etsy adapter and the sold-sync (PHA-5096)
+
+### 1. What this is an instance of
+
+Not "an Etsy integration". It is **a webhook ingest problem under an authority chain**: untrusted
+bytes → a verified event → an authoritative receipt → a state transition → a best-effort remote
+delist. Every step can fail, and the interesting failures are in the middle of the chain, not at
+its ends.
+
+### 2. The irreducible constraints
+
+1. Etsy's signature is computed over `webhook-id + "." + webhook-timestamp + "." + raw_body`,
+   base64 HMAC-SHA256 with the portal's signing secret. The raw bytes, or nothing verifies.
+2. The timestamp window is 300 seconds either way. A captured delivery must not replay.
+3. The `webhook-id` is the idempotency key, because Etsy retries on a schedule measured in hours.
+4. The receipt is fetched from the event's `resource_url` **before** stock moves. A webhook is a
+   claim; the receipt is the proof.
+5. Etsy is original/vintage only, and that is enforced per item at write time — the
+   `listings_w` create call, not the UI.
+6. Access tokens last an hour; refresh tokens have a ~90 day functional lifetime, so a refresh
+   that fails means "Emily has to consent again", not "retry harder".
+7. Quota is per API key on a sliding window: a 429 carries `retry-after` and is a wait, not a
+   failure.
+
+### 3. What a principal architect would rewrite before starting
+
+The naive version puts Etsy's rules inside the HTTP layer: `if (marketplace === 'etsy')` in the
+publish route, a signature check inline in the webhook route, and a second copy of "fetch the
+receipt first" per channel.
+
+Instead there is an **adapter seam** (`src/adapter.ts`): `publish`, `end`, and nothing else. The
+item record never learns what an Etsy listing is; it only ever sees a remote id and a state. The
+Etsy-specific rules live in `src/etsy.ts` and the delivery rules live in `src/etsy-webhook.ts`.
+
+### 4. The abstraction one level up
+
+**A sale is a state transition with a compensating action**, and the compensating action is not
+atomic with it.
+
+Ending the other channels' listings is a network call to somebody else's API. It can fail, be
+slow, or be rate limited. So it is not promised:
+
+- the sale is recorded and the other listings are ended **locally**, in the same transaction;
+- each ended listing with a remote id becomes a queued **remote action** (`remote_actions`);
+- the action is attempted once, right away;
+- if it fails — or if there is no adapter for that marketplace yet — it stays visible with
+  `needs_human = true`, and only a human finishes it.
+
+The failure this avoids: telling Emily the painting is sold everywhere, and finding out three
+days later that the eBay listing is still up and gets bought by somebody else.
+
+### 5. The day-one breakers for this slice
+
+- **A forged webhook.** It must not move anything. (`test/etsy-webhook.test.ts`)
+- **A replayed webhook** — same id, or a timestamp outside the window. It must change nothing.
+  (`test/etsy-sold-sync.test.ts`)
+- **A sale for a listing Stoop does not know.** The money moved, so it is queued for a human and
+  acknowledged, not silently dropped and not recorded against the wrong item.
+
+The Etsy-specific publish rules have their own breakers: an item that is not original/vintage is
+refused **at write time**; a 429 is waited out; a receipt URL that is not Etsy's is never fetched.
+
+### Sold-sync, in order
+
+1. `POST /webhooks/etsy` — public, because Etsy has no session.
+2. Verify the signature over the raw bytes, then the timestamp window, then parse.
+3. `order.paid` only; every other event is acknowledged and ignored.
+4. Fetch the receipt from `resource_url` (Etsy's hosts only — a payload must not become a fetch
+   to anywhere).
+5. Find the item by the listing id in the receipt, not by anything the webhook said.
+6. Record the sale: the webhook id is the idempotency key, the receipt is stored with it.
+7. Queue and attempt the cross-channel delist.
+
 ## Stack
 
 - Next.js (App Router) + Postgres, one service in the vps1 compose file (`/srv/compose.yml`).

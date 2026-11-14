@@ -249,6 +249,21 @@ export class PgLedger {
   }
 
   /**
+   * The listing that a marketplace told us about.
+   *
+   * A sale arrives naming a remote id (an Etsy listing id), not one of ours,
+   * so this is how a marketplace event finds the item it belongs to.
+   */
+  async findListingByRemoteId(marketplace: Marketplace, remoteId: string): Promise<Listing | undefined> {
+    const result = await this.pool.query<ListingRow>(
+      `SELECT id, item_id, marketplace, remote_id, state, created_at, ended_at, end_reason
+         FROM listings WHERE marketplace = $1 AND remote_id = $2 LIMIT 1`,
+      [marketplace, remoteId],
+    );
+    return result.rows[0] ? toListing(result.rows[0]) : undefined;
+  }
+
+  /**
    * Publish (or revise) the item on one marketplace.
    *
    * Revising in place is the point: eBay Inventory-API listings cannot be

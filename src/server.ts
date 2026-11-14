@@ -13,10 +13,16 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { Ledger, type Marketplace } from './ledger.ts';
 import { renderShell, type TodayItem } from './ui.ts';
-import { AUTH_STATE_COOKIE, SESSION_COOKIE, serializeCookie } from './session.ts';
+import {
+  AUTH_STATE_COOKIE,
+  SESSION_COOKIE,
+  decodeLoginState,
+  encodeLoginState,
+  serializeCookie,
+} from './session.ts';
 import {
   approveDraft,
   draftView,
@@ -30,6 +36,13 @@ import { renderFacebookCard, type FacebookCard } from './facebook.ts';
 import type { DraftStore } from './drafts.ts';
 import type { DraftPhoto, DraftRequest } from './llm.ts';
 import { DraftingError } from './llm.ts';
+import { EtsyError, EtsyPolicyError } from './etsy.ts';
+import { EtsyDeliveryError, type EtsyService } from './etsy-service.ts';
+import type { RemoteActionStore } from './etsy-store.ts';
+import type { DelistRunner } from './sync.ts';
+
+/** The cookie that carries the Etsy consent attempt across the redirect. */
+const ETSY_STATE_COOKIE = 'stoop_etsy_oauth';
 
 export interface Session {
   authUserId: string;
@@ -49,6 +62,14 @@ export interface ServerOptions {
   drafter?: Drafter;
   /** Where Emily's photos live on the box. */
   photosDir?: string;
+  /** The Etsy side: publish, connect, and the paid-order webhook. */
+  etsy?: EtsyService;
+  /** The queue of remote actions a human may have to finish by hand. */
+  remoteActions?: RemoteActionStore;
+  /** Ends the other channels' listings when an item sells. */
+  delist?: DelistRunner;
+  /** Signs the short-lived Etsy consent cookie. */
+  sessionSecret?: string;
 }
 
 /** The seam the drafter sits behind, so tests never call a model. */
@@ -130,6 +151,12 @@ function json(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+function header(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
 function readCookie(req: IncomingMessage, name: string): string | null {
   const raw = req.headers.cookie;
   if (!raw) return null;
@@ -189,6 +216,33 @@ async function saveUploads(form: FormData, photosDir: string): Promise<string[]>
   return saved;
 }
 
+/**
+ * Read one of Emily's photos as bytes, for a marketplace that wants bytes.
+ *
+ * Only files under the photos directory are read. A photo on her phone is a
+ * file on the box, not a URL we would fetch from somewhere else.
+ */
+async function readLocalImage(
+  ref: string,
+  photosDir: string,
+): Promise<{ data: Buffer; contentType: string } | null> {
+  const trimmed = ref.trim();
+  if (!trimmed || /^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) return null;
+  const root = resolve(photosDir);
+  const full = trimmed.startsWith('/')
+    ? resolve(trimmed)
+    : resolve(root, trimmed.replace(/^\/+/, ''));
+  if (full !== root && !full.startsWith(`${root}/`)) return null;
+  try {
+    const bytes = await readFile(full);
+    const ext = basename(full).toLowerCase().slice(basename(full).toLowerCase().lastIndexOf('.'));
+    const contentType = MEDIA_TYPES[`.${ext}`] ?? 'image/jpeg';
+    return { data: bytes, contentType };
+  } catch {
+    return null;
+  }
+}
+
 function itemView(item: ReturnType<Ledger['createItem']>): Record<string, unknown> {
   return {
     id: item.id,
@@ -226,6 +280,10 @@ export function createApp(options: ServerOptions): {
   const drafts = options.drafts;
   const drafter = options.drafter;
   const photosDir = options.photosDir ?? '/srv/appdata/stoop/photos';
+  const etsy = options.etsy;
+  const remoteActions = options.remoteActions;
+  const delist = options.delist;
+  const sessionSecret = options.sessionSecret;
 
   const sellerFor = async (session: Session): Promise<string> => {
     const allItems = await ledger.listItems();
@@ -248,6 +306,36 @@ export function createApp(options: ServerOptions): {
 
       if (req.method === 'GET' && url.pathname === '/healthz') {
         json(res, 200, { ok: true });
+        return;
+      }
+
+      // ── Etsy's paid-order webhook (PHA-5096) ───────────────────────────────
+      // This one is public and unauthenticated on purpose: Etsy has no
+      // session. What makes it safe is the signature over the raw bytes, the
+      // replay window, and the receipt being fetched before anything moves.
+      if (url.pathname === '/webhooks/etsy' && req.method === 'POST') {
+        if (!etsy) {
+          json(res, 503, { error: 'etsy_not_configured' });
+          return;
+        }
+        const raw = await readRaw(req);
+        try {
+          const result = await etsy.handleDelivery(raw, {
+            id: header(req, 'webhook-id'),
+            timestamp: header(req, 'webhook-timestamp'),
+            signature: header(req, 'webhook-signature'),
+          });
+          json(res, 200, result);
+        } catch (error) {
+          if (error instanceof EtsyDeliveryError) {
+            // A forged or replayed delivery: say so and stop.
+            json(res, 401, { error: error.reason });
+            return;
+          }
+          // Anything else is transient (the receipt could not be fetched).
+          // Etsy retries those, and a retry is how the receipt arrives.
+          json(res, 500, { error: 'delivery_failed', detail: String((error as Error).message ?? error) });
+        }
         return;
       }
 
@@ -368,6 +456,84 @@ export function createApp(options: ServerOptions): {
         }
         const sellerId = await sellerFor(session);
 
+        // ── Etsy: connect Emily's account (PHA-5096) ─────────────────────────
+        // Emily consents. The app never logs in for her, and the consent
+        // cookie dies in ten minutes.
+
+        if (req.method === 'GET' && url.pathname === '/api/etsy/connect') {
+          if (!etsy) {
+            json(res, 503, { error: 'etsy_not_configured' });
+            return;
+          }
+          if (!sessionSecret) {
+            json(res, 503, { error: 'session_secret_missing' });
+            return;
+          }
+          const state = randomBytes(24).toString('base64url');
+          const verifier = randomBytes(32).toString('base64url');
+          const challenge = createHash('sha256').update(verifier).digest('base64url');
+          const cookie = encodeLoginState(
+            { state, nonce: state, verifier, ts: Date.now() },
+            sessionSecret,
+          );
+          res.writeHead(302, {
+            location: etsy.authorizationUrl(state, challenge),
+            'set-cookie': serializeCookie(ETSY_STATE_COOKIE, cookie, { maxAgeSeconds: 600 }),
+          });
+          res.end();
+          return;
+        }
+
+        if (req.method === 'GET' && url.pathname === '/api/etsy/callback') {
+          if (!etsy) {
+            json(res, 503, { error: 'etsy_not_configured' });
+            return;
+          }
+          if (!sessionSecret) {
+            json(res, 503, { error: 'session_secret_missing' });
+            return;
+          }
+          const code = url.searchParams.get('code') ?? '';
+          const state = url.searchParams.get('state') ?? '';
+          const saved = decodeLoginState(readCookie(req, ETSY_STATE_COOKIE) ?? undefined, sessionSecret);
+          if (!code || !saved || saved.state !== state) {
+            json(res, 400, { error: 'etsy_callback_invalid' });
+            return;
+          }
+          try {
+            await etsy.completeAuthorization(sellerId, code, saved.verifier);
+          } catch (error) {
+            json(res, 502, { error: 'etsy_connect_failed', detail: String((error as Error).message ?? error) });
+            return;
+          }
+          res.writeHead(302, { location: '/' });
+          res.end();
+          return;
+        }
+
+        // GET /api/actions — what a human has to finish by hand
+        if (req.method === 'GET' && url.pathname === '/api/actions') {
+          if (!remoteActions) {
+            json(res, 501, { error: 'remote_actions_unavailable' });
+            return;
+          }
+          const open = await remoteActions.listOpen();
+          json(res, 200, {
+            actions: open.map((action) => ({
+              id: action.id,
+              marketplace: action.marketplace,
+              action: action.action,
+              remoteId: action.remoteId ?? null,
+              state: action.state,
+              needsHuman: action.needsHuman,
+              attempts: action.attempts,
+              lastError: action.lastError ?? null,
+              itemId: action.itemId ?? null,
+            })),
+          });
+          return;
+        }
+
         // GET /api/today — everything that needs Emily, and nothing else
         if (req.method === 'GET' && url.pathname === '/api/today') {
           const sellerItems = await ledger.listItems(sellerId);
@@ -485,7 +651,60 @@ export function createApp(options: ServerOptions): {
             json(res, 400, { error: 'facebook_requires_paste_card' });
             return;
           }
-          const remoteId = typeof body.remoteId === 'string' ? body.remoteId : null;
+          let remoteId = typeof body.remoteId === 'string' ? body.remoteId : null;
+
+          // Etsy is published through the adapter, so Etsy's own rules apply
+          // at write time. A manual remote id is the pre-adapter path and is
+          // kept only for a listing somebody else already created.
+          if (marketplace === 'etsy' && !remoteId) {
+            if (!etsy) {
+              json(res, 503, { error: 'etsy_not_configured' });
+              return;
+            }
+            if (item.originalOrVintage !== true) {
+              json(res, 400, {
+                error: 'etsy_original_vintage_only',
+                detail: 'etsy is original/vintage only; this item does not say it is either',
+              });
+              return;
+            }
+            const images = [];
+            for (const ref of item.photos) {
+              const image = await readLocalImage(ref, photosDir);
+              if (image) images.push(image);
+            }
+            try {
+              const published = await etsy.publishListing({
+                itemId: item.id,
+                title: item.title,
+                description: item.description,
+                priceCents: item.priceCents,
+                tags: item.tags,
+                originalOrVintage: item.originalOrVintage,
+                images,
+                ...(typeof body.taxonomyId === 'number' ? { taxonomyId: body.taxonomyId } : {}),
+                ...(typeof body.shippingProfileId === 'number'
+                  ? { shippingProfileId: body.shippingProfileId }
+                  : {}),
+                ...(body.whoMade === 'i_did' || body.whoMade === 'someone_else' || body.whoMade === 'collective'
+                  ? { whoMade: body.whoMade }
+                  : {}),
+                ...(typeof body.whenMade === 'string' ? { whenMade: body.whenMade } : {}),
+              });
+              remoteId = published.remoteId;
+            } catch (error) {
+              if (error instanceof EtsyPolicyError) {
+                json(res, 400, { error: error.code, detail: error.message });
+                return;
+              }
+              if (error instanceof EtsyError) {
+                json(res, 502, { error: 'etsy_publish_failed', detail: error.message });
+                return;
+              }
+              throw error;
+            }
+          }
+
           const listing = await ledger.publish(item.id, marketplace, remoteId);
           json(res, 200, { listing });
           return;
@@ -526,9 +745,23 @@ export function createApp(options: ServerOptions): {
           }
           const result = await ledger.markSold(item.id, `manual_${item.id}`);
           const duplicates = await ledger.getDuplicateSales(item.id);
+          // The local sale is the truth. Ending the other channels is a
+          // remote call that can fail, so it is queued, not promised.
+          const delistOutcome = delist
+            ? await delist.delist(
+                result.endedListings.map((listing) => ({
+                  listingId: listing.id,
+                  itemId: listing.itemId,
+                  marketplace: listing.marketplace,
+                  remoteId: listing.remoteId,
+                })),
+              )
+            : undefined;
           json(res, 200, {
             outcome: result.outcome,
             endedListings: result.endedListings.length,
+            delisted: delistOutcome?.succeeded ?? 0,
+            needsHuman: delistOutcome?.needsHuman ?? 0,
             ended: result.endedListings.map((l) => ({
               marketplace: l.marketplace,
               state: l.state,
