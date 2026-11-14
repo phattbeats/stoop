@@ -1,0 +1,11 @@
+{
+  "name": "stoop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stoop: Emily's one-record listing app (eBay + Etsy + Facebook paste card). PHATT ID login.",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  }
+}
