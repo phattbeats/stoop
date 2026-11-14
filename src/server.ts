@@ -266,6 +266,45 @@ async function readLocalImage(
   }
 }
 
+/**
+ * The marketplaces an item can be published to, from the phone's point of
+ * view.
+ *
+ * Two questions per marketplace: is it configured, and is this item allowed
+ * on it? The second one is the marketplace's own rule — Etsy is
+ * original/vintage only — and it is enforced here so the phone does not
+ * offer a button that is going to be refused.
+ *
+ * A marketplace that is not configured is not shown at all. A button that
+ * always fails is worse than no button.
+ */
+function publishableFor(
+  item: { id: string; originalOrVintage: boolean | null; status: string },
+  listings: { marketplace: string; state: string }[],
+  adapters: { ebay?: unknown; etsy?: unknown },
+): { marketplace: string; published: boolean; eligible: boolean; reason?: string }[] {
+  const out: { marketplace: string; published: boolean; eligible: boolean; reason?: string }[] = [];
+
+  if (adapters.ebay) {
+    out.push({
+      marketplace: 'ebay',
+      published: listings.some((l) => l.marketplace === 'ebay' && l.state === 'live'),
+      eligible: true,
+    });
+  }
+  if (adapters.etsy) {
+    // Etsy's rule, applied before the button is offered.
+    const eligible = item.originalOrVintage === true;
+    out.push({
+      marketplace: 'etsy',
+      published: listings.some((l) => l.marketplace === 'etsy' && l.state === 'live'),
+      eligible,
+      ...(eligible ? {} : { reason: 'original or vintage only' }),
+    });
+  }
+  return out;
+}
+
 function itemView(item: ReturnType<Ledger['createItem']>): Record<string, unknown> {
   return {
     id: item.id,
@@ -483,6 +522,7 @@ export function createApp(options: ServerOptions): {
               ),
               card: facebookCardFor(item),
               listings: itemListings.map((l) => ({ marketplace: l.marketplace, state: l.state })),
+              publishable: publishableFor(item, itemListings, { ebay, etsy }),
             };
           }),
         );

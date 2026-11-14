@@ -47,6 +47,12 @@ export interface TodayItem {
   postedOnFacebook: boolean;
   card: CardView;
   listings: { marketplace: string; state: string }[];
+  /**
+   * The marketplaces this item can be published to, and which of them it is
+   * already on. The phone needs this: an adapter nobody can reach from the
+   * phone is an adapter that does not exist.
+   */
+  publishable: { marketplace: string; published: boolean; eligible: boolean; reason?: string }[];
 }
 
 function money(cents: number): string {
@@ -64,6 +70,49 @@ function escapeHtml(value: string): string {
 /** "good" -> "Good", "like new" -> "Like new". */
 function titleCase(value: string): string {
   return value.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/**
+ * How a marketplace is written. eBay is a brand, not a word to title-case.
+ */
+const MARKETPLACE_NAMES: Record<string, string> = {
+  ebay: 'eBay',
+  etsy: 'Etsy',
+  facebook: 'Facebook',
+};
+
+/**
+ * The publish buttons for one item.
+ *
+ * One button per marketplace the item can go on. Facebook is not one of
+ * them — Facebook is a paste card, and the card is right below.
+ *
+ * A marketplace that is already live shows as done, because a second
+ * listing for the same thing is how you sell it twice.
+ */
+function publishButtons(item: TodayItem): string {
+  const buttons = item.publishable
+    .filter((entry) => entry.marketplace !== 'facebook')
+    .map((entry) => {
+      const label = MARKETPLACE_NAMES[entry.marketplace] ?? titleCase(entry.marketplace);
+      if (!entry.eligible) {
+        return `<button class="publish-btn" data-item="${escapeHtml(item.id)}" data-marketplace="${escapeHtml(
+          entry.marketplace,
+        )}" disabled>${label} — ${escapeHtml(entry.reason ?? 'not eligible')}</button>`;
+      }
+      if (entry.published) {
+        return `<button class="publish-btn done" data-item="${escapeHtml(item.id)}" data-marketplace="${escapeHtml(
+          entry.marketplace,
+        )}" disabled>${label} ✓</button>`;
+      }
+      return `<button class="publish-btn" data-item="${escapeHtml(item.id)}" data-marketplace="${escapeHtml(
+        entry.marketplace,
+      )}">Publish to ${label}</button>`;
+    });
+  if (!buttons.length) return '<p class="meta-line dim">No marketplace is available for this yet.</p>';
+  return `<div class="row publish-row">${buttons.join('')}</div><p class="meta-line flags publish-error" data-error="${escapeHtml(
+    item.id,
+  )}"></p>`;
 }
 
 /** A remote action that only a human can finish. */
@@ -161,6 +210,10 @@ export function renderShell(options: {
           </div>
         </div>
         <details class="fb">
+          <summary>Sell it</summary>
+          ${publishButtons(item)}
+        </details>
+        <details class="fb">
           <summary>Facebook card</summary>
           <textarea class="card" readonly data-card="${escapeHtml(item.id)}">${escapeHtml(item.card.text)}</textarea>
           <button class="copy" data-item="${escapeHtml(item.id)}">Copy card</button>
@@ -230,6 +283,9 @@ export function renderShell(options: {
   button.reject { background:#21262d; color:var(--ink); }
   button.sold-btn { background:#2d333b; color:var(--ink); }
   button.copy { margin-top:8px; background:#21262d; color:var(--ink); }
+  button.publish-btn { background:#1f6feb; color:#fff; }
+  button.publish-btn:disabled { background:#21262d; color:var(--dim); }
+  .publish-row { margin-top:8px; }
   button.done { opacity:.65; }
   details.fb { margin-top:10px; border-top:1px solid #21262d; padding-top:8px; }
   details.fb summary { color:var(--dim); font-size:14px; cursor:pointer; }
@@ -338,6 +394,33 @@ ${
       });
       if (res.ok) location.reload();
       else btn.textContent = 'Could not post';
+    });
+  });
+
+  document.querySelectorAll('button.publish-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const marketplace = btn.dataset.marketplace;
+      if (!marketplace || btn.disabled) return;
+      btn.textContent = 'Publishing…';
+      btn.disabled = true;
+      const res = await fetch('/api/items/' + btn.dataset.item + '/publish', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ marketplace }),
+      });
+      if (res.ok) {
+        location.reload();
+        return;
+      }
+      // The reason matters: an offer that did not go live, a policy that is
+      // missing, an account that is not connected. Saying "failed" would
+      // leave Emily with nothing to act on.
+      const body = await res.json().catch(() => ({}));
+      btn.textContent = 'Could not publish';
+      btn.disabled = false;
+      // A tooltip is invisible on a phone, so the reason goes in the page.
+      const note = document.querySelector('.publish-error[data-error="' + btn.dataset.item + '"]');
+      if (note) note.textContent = body.detail ?? body.error ?? 'the marketplace said no';
     });
   });
 
