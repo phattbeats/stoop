@@ -16,6 +16,8 @@ import { PgLedger } from './store.ts';
 import { PgDraftStore } from './drafts.ts';
 import { AnthropicPathDrafter } from './llm.ts';
 import { EtsyAdapter, EtsyClient } from './etsy.ts';
+import { EBayAdapter } from './ebay.ts';
+import { EBayClient } from './ebay-client.ts';
 import { EtsyService } from './etsy-service.ts';
 import type { EtsySaleLedger } from './etsy-service.ts';
 import { EtsyTokenManager, PgEtsyTokenStore, PgRemoteActionStore } from './etsy-store.ts';
@@ -61,6 +63,37 @@ const drafter = config.llmApiKey
 const remoteActions = new PgRemoteActionStore(pool);
 const adapters: Partial<Record<Marketplace, MarketplaceAdapter>> = {};
 let etsyService: EtsyService | undefined;
+
+// ── eBay (PHA-5093) ──────────────────────────────────────────────────────────
+//
+// Optional, like Etsy: without credentials the app still serves the Today
+// screen and the Facebook card. Nothing here pretends to be connected until
+// it really is — the adapter refuses to publish without the inventory
+// location, category and store policies, so a half-configured keyset fails
+// loudly instead of creating offers that never go live.
+
+if (config.ebay) {
+  const client = new EBayClient({
+    clientId: config.ebay.clientId,
+    clientSecret: config.ebay.clientSecret,
+    environment: config.ebay.environment,
+    scope: config.ebay.scope,
+    marketplaceId: config.ebay.marketplaceId,
+    ...(config.ebay.refreshToken ? { refreshToken: config.ebay.refreshToken } : {}),
+  });
+  const adapter = new EBayAdapter(
+    client,
+    { accessToken: () => client.accessToken() },
+    {
+      inventoryLocationId: config.ebay.inventoryLocationId ?? '',
+      categoryId: config.ebay.categoryId ?? '',
+      fulfillmentPolicyId: config.ebay.fulfillmentPolicyId ?? '',
+      paymentPolicyId: config.ebay.paymentPolicyId ?? '',
+      returnPolicyId: config.ebay.returnPolicyId ?? '',
+    },
+  );
+  adapters.ebay = adapter;
+}
 
 if (config.etsy) {
   const client = new EtsyClient({
@@ -111,6 +144,7 @@ const { server } = createApp({
   ...(drafter ? { drafter } : {}),
   photosDir: config.photosDir,
   ...(etsyService ? { etsy: etsyService } : {}),
+  ...(adapters.ebay ? { ebay: adapters.ebay } : {}),
   remoteActions,
   delist: new DelistRunner(remoteActions, adapters),
   sessionSecret: config.sessionSecret,

@@ -37,6 +37,8 @@ import type { DraftStore } from './drafts.ts';
 import type { DraftPhoto, DraftRequest } from './llm.ts';
 import { DraftingError } from './llm.ts';
 import { EtsyError, EtsyPolicyError } from './etsy.ts';
+import { EBayError, EBayPolicyError } from './ebay-client.ts';
+import type { MarketplaceAdapter, PublishImage } from './adapter.ts';
 import { EtsyDeliveryError, type EtsyService } from './etsy-service.ts';
 import type { RemoteActionStore } from './etsy-store.ts';
 import type { DelistRunner } from './sync.ts';
@@ -64,6 +66,8 @@ export interface ServerOptions {
   photosDir?: string;
   /** The Etsy side: publish, connect, and the paid-order webhook. */
   etsy?: EtsyService;
+  /** The eBay side: the Sell Inventory offer flow. */
+  ebay?: MarketplaceAdapter;
   /** The queue of remote actions a human may have to finish by hand. */
   remoteActions?: RemoteActionStore;
   /** Ends the other channels' listings when an item sells. */
@@ -281,6 +285,7 @@ export function createApp(options: ServerOptions): {
   const drafter = options.drafter;
   const photosDir = options.photosDir ?? '/srv/appdata/stoop/photos';
   const etsy = options.etsy;
+  const ebay = options.ebay;
   const remoteActions = options.remoteActions;
   const delist = options.delist;
   const sessionSecret = options.sessionSecret;
@@ -680,6 +685,54 @@ export function createApp(options: ServerOptions): {
             return;
           }
           let remoteId = typeof body.remoteId === 'string' ? body.remoteId : null;
+
+          // eBay is published through the adapter, so the Sell Inventory
+          // rules apply at write time: an inventory item, an offer, and the
+          // listing policies that make the offer live. A manual remote id is
+          // the pre-adapter path and is kept only for a listing somebody
+          // else already created.
+          if (marketplace === 'ebay' && !remoteId) {
+            if (!ebay) {
+              json(res, 503, { error: 'ebay_not_configured' });
+              return;
+            }
+            const images: PublishImage[] = [];
+            for (const ref of item.photos) {
+              const image = await readLocalImage(ref, photosDir);
+              if (image) images.push(image);
+            }
+            try {
+              const published = await ebay.publish({
+                itemId: item.id,
+                title: item.title,
+                description: item.description,
+                priceCents: item.priceCents,
+                tags: item.tags,
+                originalOrVintage: item.originalOrVintage,
+                // eBay has no who-made/when-made equivalent — its categories
+                // and condition fields carry that, not a separate claim. The
+                // adapter never reads this, so it is inert here rather than
+                // a fabricated fact about Emily's print.
+                attribution: {
+                  whoMade: 'i_did',
+                  whenMade: '2020_2023',
+                },
+                taxonomyId: 0,
+                images,
+              });
+              remoteId = published.remoteId;
+            } catch (error) {
+              if (error instanceof EBayPolicyError) {
+                json(res, 400, { error: error.code, detail: error.message });
+                return;
+              }
+              if (error instanceof EBayError) {
+                json(res, 502, { error: 'ebay_publish_failed', detail: error.message });
+                return;
+              }
+              throw error;
+            }
+          }
 
           // Etsy is published through the adapter, so Etsy's own rules apply
           // at write time. A manual remote id is the pre-adapter path and is

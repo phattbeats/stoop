@@ -56,6 +56,17 @@ export interface EbayConfig {
   sellerUserId?: string;
   /** Where eBay sends the seller back after consent. */
   redirectUri: string;
+  /**
+   * Where the seller's items live. eBay will not create an inventory item
+   * without it, and it cannot be inferred — it is a per-account id.
+   */
+  inventoryLocationId?: string;
+  /** The category items are listed in. */
+  categoryId?: string;
+  /** The store's three policies. An offer without them never goes live. */
+  fulfillmentPolicyId?: string;
+  paymentPolicyId?: string;
+  returnPolicyId?: string;
 }
 
 /**
@@ -154,6 +165,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     if (refreshToken) ebay.refreshToken = refreshToken;
     const sellerUserId = optional('STOOP_EBAY_SELLER_USER_ID', '');
     if (sellerUserId) ebay.sellerUserId = sellerUserId;
+    const inventoryLocationId = optional('STOOP_EBAY_INVENTORY_LOCATION_ID', '');
+    if (inventoryLocationId) ebay.inventoryLocationId = inventoryLocationId;
+    const categoryId = optional('STOOP_EBAY_CATEGORY_ID', '');
+    if (categoryId) ebay.categoryId = categoryId;
+    const fulfillmentPolicyId = optional('STOOP_EBAY_FULFILLMENT_POLICY_ID', '');
+    if (fulfillmentPolicyId) ebay.fulfillmentPolicyId = fulfillmentPolicyId;
+    const paymentPolicyId = optional('STOOP_EBAY_PAYMENT_POLICY_ID', '');
+    if (paymentPolicyId) ebay.paymentPolicyId = paymentPolicyId;
+    const returnPolicyId = optional('STOOP_EBAY_RETURN_POLICY_ID', '');
+    if (returnPolicyId) ebay.returnPolicyId = returnPolicyId;
     config.ebay = ebay;
   }
 
