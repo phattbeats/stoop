@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import { Pool } from 'pg';
 import { Ledger } from '../src/ledger.ts';
 import { PgLedger } from '../src/store.ts';
+import { PgEtsyTokenStore, PgRemoteActionStore } from '../src/etsy-store.ts';
 
 const databaseUrl = process.env.STOOP_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
@@ -217,4 +218,101 @@ integration('the Postgres store keeps the Facebook paste-card rules', async (t) 
   const duplicates = await store.getDuplicateSales(other.id);
   assert.equal(duplicates.length, 1);
   assert.equal(duplicates[0].marketplace, 'facebook');
+});
+
+integration('the Postgres store finds a listing by the id a marketplace names', async (t) => {
+  const pool = new Pool({ connectionString: databaseUrl });
+  const store = new PgLedger(pool);
+  const reference = new Ledger();
+
+  const stamp = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const seller = await store.addSeller({ id: 'ignored', authUserId: `auth-${stamp}`, displayName: 'Emily' });
+  const refSeller = reference.addSeller({
+    id: seller.id,
+    authUserId: seller.authUserId,
+    displayName: seller.displayName,
+  });
+
+  t.after(async () => {
+    await pool.query(`DELETE FROM sellers WHERE auth_user_id LIKE $1`, [`%${stamp}`]);
+    await pool.end();
+  });
+
+  const item = await store.createItem({ sellerId: seller.id, title: 'Print no. 3', priceCents: 3500 });
+  const refItem = reference.createItem({ sellerId: refSeller.id, title: 'Print no. 3', priceCents: 3500 });
+  await store.publish(item.id, 'etsy', 'etsy-listing-1');
+  await store.publish(item.id, 'ebay', 'ebay-offer-1');
+  reference.publish(refItem.id, 'etsy', 'etsy-listing-1');
+  reference.publish(refItem.id, 'ebay', 'ebay-offer-1');
+
+  // The way a marketplace event finds its item: by the remote id, not ours.
+  const found = await store.findListingByRemoteId('etsy', 'etsy-listing-1');
+  const refFound = reference.findListingByRemoteId('etsy', 'etsy-listing-1');
+  assert.equal(found?.itemId, item.id);
+  assert.equal(refFound?.itemId, refItem.id);
+  assert.equal(await store.findListingByRemoteId('etsy', 'nope'), undefined);
+  assert.equal(reference.findListingByRemoteId('etsy', 'nope'), undefined);
+});
+
+integration('the Postgres Etsy token store and remote action queue behave', async (t) => {
+  const pool = new Pool({ connectionString: databaseUrl });
+  const tokens = new PgEtsyTokenStore(pool);
+  const actions = new PgRemoteActionStore(pool);
+
+  const stamp = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const ledger = new PgLedger(pool);
+  const seller = await ledger.addSeller({ id: 'ignored', authUserId: `auth-${stamp}`, displayName: 'Emily' });
+
+  t.after(async () => {
+    await pool.query(`DELETE FROM sellers WHERE auth_user_id LIKE $1`, [`%${stamp}`]);
+    await pool.end();
+  });
+
+  // Tokens: saved, found by seller and by shop, and re-consented before they die.
+  const saved = await tokens.save(seller.id, {
+    accessToken: '12345678.token',
+    refreshToken: '12345678.refresh',
+    expiresIn: 3600,
+    scope: 'listings_w transactions_r',
+    shopId: '42',
+  });
+  assert.equal(saved.shopId, '42');
+  assert.ok(Date.parse(saved.accessExpiresAt) > Date.now());
+  assert.ok(Date.parse(saved.refreshExpiresAt) > Date.parse(saved.accessExpiresAt));
+  assert.equal((await tokens.get(seller.id))?.refreshToken, '12345678.refresh');
+  assert.equal((await tokens.getByShopId('42'))?.sellerId, seller.id);
+  assert.equal((await tokens.first())?.sellerId, seller.id);
+
+  // The same action twice is still one action.
+  const item = await ledger.createItem({ sellerId: seller.id, title: 'Print no. 3', priceCents: 3500 });
+  const listing = await ledger.publish(item.id, 'etsy', 'etsy-listing-1');
+  const first = await actions.enqueue({
+    itemId: item.id,
+    listingId: listing.id,
+    marketplace: 'etsy',
+    action: 'delist',
+    remoteId: 'etsy-listing-1',
+  });
+  const again = await actions.enqueue({
+    itemId: item.id,
+    listingId: listing.id,
+    marketplace: 'etsy',
+    action: 'delist',
+    remoteId: 'etsy-listing-1',
+  });
+  assert.equal(again.id, first.id);
+
+  // A failed remote delist stays visible for a human.
+  await actions.markFailed(first.id, 'etsy said no');
+  const open = await actions.listOpen();
+  const failed = open.find((a) => a.id === first.id);
+  assert.equal(failed?.state, 'needs_human');
+  assert.equal(failed?.needsHuman, true);
+  assert.equal(failed?.lastError, 'etsy said no');
+  assert.equal(failed?.attempts, 1);
+
+  // And a successful one is finished with.
+  await actions.markSucceeded(first.id, { alreadyGone: true });
+  const stillOpen = await actions.listOpen();
+  assert.equal(stillOpen.find((a) => a.id === first.id), undefined);
 });
