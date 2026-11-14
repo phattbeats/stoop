@@ -13,6 +13,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Ledger, type Marketplace } from './ledger.ts';
 import { renderShell, type TodayItem } from './ui.ts';
+import { AUTH_STATE_COOKIE, SESSION_COOKIE, serializeCookie } from './session.ts';
 
 export interface Session {
   authUserId: string;
@@ -24,6 +25,20 @@ export type SessionVerifier = (token: string | null) => Session | null;
 export interface ServerOptions {
   ledger?: Ledger;
   verifySession: SessionVerifier;
+  /** PHATT ID login. Without it the app has no way in. */
+  auth?: AuthHooks;
+}
+
+export interface AuthHooks {
+  /** URL the browser goes to, plus the short-lived state cookie to set. */
+  begin: () => Promise<{ url: string; cookie: string }>;
+  /** Exchange the code, mint a session, return the session token. */
+  complete: (params: {
+    code: string;
+    state: string;
+    cookie: string | null;
+  }) => Promise<{ token: string; maxAgeSeconds: number } | null>;
+  logout?: (token: string | null) => Promise<void>;
 }
 
 const MARKETPLACES: Marketplace[] = ['ebay', 'etsy', 'facebook'];
@@ -78,6 +93,7 @@ export function createApp(options: ServerOptions): {
 } {
   const ledger = options.ledger ?? new Ledger();
   const verifySession = options.verifySession;
+  const auth = options.auth;
 
   const sellerFor = (session: Session): string => {
     const existing = ledger
@@ -96,8 +112,69 @@ export function createApp(options: ServerOptions): {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost');
-      const token = readCookie(req, 'stoop_session');
+      const token = readCookie(req, SESSION_COOKIE);
       const session = verifySession(token);
+
+      if (req.method === 'GET' && url.pathname === '/healthz') {
+        json(res, 200, { ok: true });
+        return;
+      }
+
+      // ── PHATT ID login (PHA-5092) ───────────────────────────────────────────
+      if (url.pathname === '/auth/login' && req.method === 'GET') {
+        if (session) {
+          res.writeHead(302, { location: '/' });
+          res.end();
+          return;
+        }
+        if (!auth) {
+          json(res, 404, { error: 'not_found' });
+          return;
+        }
+        const started = await auth.begin();
+        res.writeHead(302, {
+          location: started.url,
+          'set-cookie': serializeCookie(AUTH_STATE_COOKIE, started.cookie, { maxAgeSeconds: 600 }),
+        });
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/auth/callback' && req.method === 'GET') {
+        if (!auth) {
+          json(res, 404, { error: 'not_found' });
+          return;
+        }
+        const result = await auth.complete({
+          code: url.searchParams.get('code') ?? '',
+          state: url.searchParams.get('state') ?? '',
+          cookie: readCookie(req, AUTH_STATE_COOKIE),
+        });
+        if (!result) {
+          res.writeHead(302, { location: '/?error=login_failed' });
+          res.end();
+          return;
+        }
+        res.writeHead(302, {
+          location: '/',
+          'set-cookie': [
+            serializeCookie(SESSION_COOKIE, result.token, { maxAgeSeconds: result.maxAgeSeconds }),
+            serializeCookie(AUTH_STATE_COOKIE, '', { maxAgeSeconds: 0 }),
+          ],
+        });
+        res.end();
+        return;
+      }
+
+      if (url.pathname === '/auth/logout' && (req.method === 'POST' || req.method === 'GET')) {
+        if (auth?.logout) await auth.logout(token);
+        res.writeHead(302, {
+          location: '/',
+          'set-cookie': serializeCookie(SESSION_COOKIE, '', { maxAgeSeconds: 0 }),
+        });
+        res.end();
+        return;
+      }
 
       if (req.method === 'GET' && url.pathname === '/') {
         if (!session) {

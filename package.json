@@ -2,10 +2,21 @@
   "name": "stoop",
   "version": "0.1.0",
   "private": true,
-  "description": "Stoop: Emily's one-record listing app (eBay + Etsy + Facebook paste card). PHATT ID login.",
+  "description": "Stoop: Emily's one-record listing app (eBay + Etsy + Facebook paste card), PHATT ID login.",
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "start": "node src/main.ts",
+    "migrate": "node src/migrate.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2"
   }
 }
