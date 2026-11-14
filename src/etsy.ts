@@ -103,9 +103,11 @@ export interface EtsyListingFields {
 
 export interface EtsyQuotaSnapshot {
   status: number;
-  limit?: string;
-  remaining?: string;
-  reached?: string;
+  /**
+   * Whatever Etsy sent back about the quota. The header names are not
+   * documented, so they are captured as-is rather than guessed at.
+   */
+  headers: Record<string, string>;
 }
 
 export interface EtsyReceiptSummary {
@@ -415,14 +417,11 @@ export class EtsyClient {
 }
 
 function readQuota(response: Response): EtsyQuotaSnapshot {
-  const snapshot: EtsyQuotaSnapshot = { status: response.status };
-  const limit = response.headers.get('x-etsy-limit-reached') ?? response.headers.get('x-etsy-limit');
-  const remaining = response.headers.get('x-etsy-limit-remaining');
-  const reached = response.headers.get('x-etsy-limit-reached');
-  if (limit !== null) snapshot.limit = limit;
-  if (remaining !== null) snapshot.remaining = remaining;
-  if (reached !== null) snapshot.reached = reached;
-  return snapshot;
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    if (key.toLowerCase().startsWith('x-etsy-')) headers[key.toLowerCase()] = value;
+  });
+  return { status: response.status, headers };
 }
 
 /**
