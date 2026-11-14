@@ -427,9 +427,24 @@ export function createApp(options: ServerOptions): {
         const pending = drafts
           ? (await drafts.listForSeller(sellerId)).filter((draft) => draft.status === 'draft')
           : [];
+        // The queue a human has to work through: a listing that could not be
+        // ended on the other marketplace. A queue nobody can see is not
+        // surfaced, it is just lost.
+        const openActions = remoteActions ? await remoteActions.listOpen() : [];
         const html = renderShell({
           displayName: session.displayName,
           items,
+          actions: openActions
+            .filter((action) => action.needsHuman)
+            .map((action) => ({
+              id: action.id,
+              marketplace: action.marketplace,
+              what:
+                action.action === 'delist'
+                  ? `A ${action.marketplace} listing still needs to be ended by hand`
+                  : `A ${action.marketplace} sale needs a look`,
+              ...(action.lastError ? { detail: action.lastError } : {}),
+            })),
           drafts: pending.map((draft) => ({
             id: draft.id,
             title: draft.title,
@@ -556,7 +571,20 @@ export function createApp(options: ServerOptions): {
               };
             }),
           );
-          json(res, 200, { items });
+          const openActions = remoteActions ? await remoteActions.listOpen() : [];
+          json(res, 200, {
+            items,
+            actions: openActions
+              .filter((action) => action.needsHuman)
+              .map((action) => ({
+                id: action.id,
+                marketplace: action.marketplace,
+                action: action.action,
+                remoteId: action.remoteId ?? null,
+                state: action.state,
+                lastError: action.lastError ?? null,
+              })),
+          });
           return;
         }
 

@@ -64,13 +64,35 @@ function titleCase(value: string): string {
   return value.replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+/** A remote action that only a human can finish. */
+export interface ActionView {
+  id: string;
+  marketplace: string;
+  /** One line, said to Emily. */
+  what: string;
+  /** The raw reason, for whoever looks at it second. */
+  detail?: string;
+}
+
 export function renderShell(options: {
   displayName: string;
   items: TodayItem[];
   /** Drafts waiting on Emily. The model proposed; she decides. */
   drafts?: PendingDraft[];
+  /** Things only a human can finish: a listing that has to be ended by hand. */
+  actions?: ActionView[];
 }): string {
-  const { displayName, items, drafts = [] } = options;
+  const { displayName, items, drafts = [], actions = [] } = options;
+
+  const actionCards = actions
+    .map(
+      (action) => `
+      <li class="action">
+        <p class="title">${escapeHtml(action.what)}</p>
+        ${action.detail ? `<p class="meta-line flags">${escapeHtml(action.detail)}</p>` : ''}
+      </li>`,
+    )
+    .join('\n');
 
   const draftCards = drafts
     .map((draft) => {
@@ -183,6 +205,12 @@ export function renderShell(options: {
   .badge.sold { background:#7ee78722; color:var(--accent); }
   .badge.fb { background:#1877f222; color:#79c0ff; }
   .badge.refund { background:#d2992222; color:#d29922; }
+  section.actions { margin: 4px 12px 18px; }
+  section.actions h2 { font-size: 17px; margin: 10px 4px 6px; color: #d29922;
+                       text-transform: uppercase; letter-spacing:.6px; }
+  section.actions ul { list-style:none; margin:0; padding:0; }
+  li.action { background: var(--card); border-radius:14px; padding:12px; margin-bottom:10px;
+              border-left:3px solid #d29922; }
   .empty { color:var(--dim); text-align:center; padding:48px 18px; }
   section.drafts { margin: 4px 12px 18px; }
   section.drafts h2 { font-size: 17px; margin: 10px 4px 6px; color: var(--dim);
@@ -225,6 +253,11 @@ ${rows || '<li class="empty">Nothing here yet. Photograph something.</li>'}
 ${
   draftCards
     ? `<section class="drafts"><h2>Waiting on you</h2><ul>${draftCards}</ul></section>`
+    : ''
+}
+${
+  actionCards
+    ? `<section class="actions"><h2>Needs you</h2><ul>${actionCards}</ul></section>`
     : ''
 }
 <form id="snap" autocomplete="off" enctype="multipart/form-data">
