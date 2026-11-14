@@ -95,13 +95,12 @@ export function createApp(options: ServerOptions): {
   const verifySession = options.verifySession;
   const auth = options.auth;
 
-  const sellerFor = (session: Session): string => {
-    const existing = ledger
-      .listItems()
-      .map((i) => ledger.getSeller(i.sellerId))
-      .find((s) => s?.authUserId === session.authUserId);
+  const sellerFor = async (session: Session): Promise<string> => {
+    const allItems = await ledger.listItems();
+    const sellers = await Promise.all(allItems.map((i) => ledger.getSeller(i.sellerId)));
+    const existing = sellers.find((s) => s?.authUserId === session.authUserId);
     if (existing) return existing.id;
-    const seller = ledger.addSeller({
+    const seller = await ledger.addSeller({
       id: `seller_${session.authUserId}`,
       authUserId: session.authUserId,
       displayName: session.displayName,
@@ -182,19 +181,24 @@ export function createApp(options: ServerOptions): {
           res.end();
           return;
         }
-        const sellerId = sellerFor(session);
-        const items: TodayItem[] = ledger.listItems(sellerId).map((item) => ({
-          id: item.id,
-          title: item.title,
-          priceCents: item.priceCents,
-          status: item.status,
-          photos: item.photos,
-          sold: ledger.isSold(item.id),
-          listings: ledger
-            .listListings(item.id)
-            .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
-            .map((l) => ({ marketplace: l.marketplace, state: l.state })),
-        }));
+        const sellerId = await sellerFor(session);
+        const sellerItems = await ledger.listItems(sellerId);
+        const items: TodayItem[] = await Promise.all(
+          sellerItems.map(async (item) => {
+            const itemListings = await ledger.listListings(item.id);
+            return {
+              id: item.id,
+              title: item.title,
+              priceCents: item.priceCents,
+              status: item.status,
+              photos: item.photos,
+              sold: await ledger.isSold(item.id),
+              listings: itemListings
+                .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
+                .map((l) => ({ marketplace: l.marketplace, state: l.state })),
+            };
+          }),
+        );
         const html = renderShell({ displayName: session.displayName, items });
         res.writeHead(200, {
           'content-type': 'text/html; charset=utf-8',
@@ -209,18 +213,23 @@ export function createApp(options: ServerOptions): {
           json(res, 401, { error: 'sign_in_required' });
           return;
         }
-        const sellerId = sellerFor(session);
+        const sellerId = await sellerFor(session);
 
         // GET /api/today — everything that needs Emily, and nothing else
         if (req.method === 'GET' && url.pathname === '/api/today') {
-          const items = ledger.listItems(sellerId).map((item) => ({
-            ...itemView(item),
-            listings: ledger
-              .listListings(item.id)
-              .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
-              .map((l) => ({ marketplace: l.marketplace, state: l.state, remoteId: l.remoteId })),
-            sold: ledger.isSold(item.id),
-          }));
+          const sellerItems = await ledger.listItems(sellerId);
+          const items = await Promise.all(
+            sellerItems.map(async (item) => {
+              const itemListings = await ledger.listListings(item.id);
+              return {
+                ...itemView(item),
+                listings: itemListings
+                  .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
+                  .map((l) => ({ marketplace: l.marketplace, state: l.state, remoteId: l.remoteId })),
+                sold: await ledger.isSold(item.id),
+              };
+            }),
+          );
           json(res, 200, { items });
           return;
         }
@@ -241,7 +250,7 @@ export function createApp(options: ServerOptions): {
           const photos = Array.isArray(body.photos)
             ? body.photos.filter((p): p is string => typeof p === 'string')
             : [];
-          const item = ledger.createItem({
+          const item = await ledger.createItem({
             sellerId,
             title,
             description: typeof body.description === 'string' ? body.description : '',
@@ -258,7 +267,7 @@ export function createApp(options: ServerOptions): {
         // POST /api/items/:id/publish — publish one record to one marketplace
         const publishMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/publish$/);
         if (req.method === 'POST' && publishMatch) {
-          const item = ledger.getItem(publishMatch[1]);
+          const item = await ledger.getItem(publishMatch[1]);
           if (!item || item.sellerId !== sellerId) {
             json(res, 404, { error: 'item_not_found' });
             return;
@@ -270,7 +279,7 @@ export function createApp(options: ServerOptions): {
             return;
           }
           const remoteId = typeof body.remoteId === 'string' ? body.remoteId : null;
-          const listing = ledger.publish(item.id, marketplace, remoteId);
+          const listing = await ledger.publish(item.id, marketplace, remoteId);
           json(res, 200, { listing });
           return;
         }
@@ -278,12 +287,12 @@ export function createApp(options: ServerOptions): {
         // POST /api/items/:id/mark-sold — the Facebook tap
         const soldMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/mark-sold$/);
         if (req.method === 'POST' && soldMatch) {
-          const item = ledger.getItem(soldMatch[1]);
+          const item = await ledger.getItem(soldMatch[1]);
           if (!item || item.sellerId !== sellerId) {
             json(res, 404, { error: 'item_not_found' });
             return;
           }
-          const result = ledger.markSold(item.id, `manual_${item.id}`);
+          const result = await ledger.markSold(item.id, `manual_${item.id}`);
           json(res, 200, {
             outcome: result.outcome,
             endedListings: result.endedListings.length,
