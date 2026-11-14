@@ -62,6 +62,39 @@ expressed as constraints in `db/schema.sql`.
 A second day-one breaker: **the same webhook arriving twice** (Etsy retries). Covered by the
 `order_events` idempotency key.
 
+## The Facebook card (PHA-5097)
+
+Facebook is not a channel the app can write to. No browser automation, no login, no scraping — so
+the honest abstraction is not "a third adapter" but **a channel that must be written by the human,
+and therefore a card plus a state**:
+
+- The app's job on Facebook is to produce the exact text and to track whether the human did it.
+- "Posted on FB" is a **state on the listing**, not a remote id: `marketplace = 'facebook'`,
+  `remote_id = null`, forever. There is no Facebook listing id because Stoop never touches
+  Facebook. Publishing to Facebook is refused outright — it would claim a listing the app did not
+  create and cannot manage.
+- A paste card is not inventory. It becomes a listing only when she says it is posted.
+
+The honesty rules are the product, and they run off the **item record**, not off the model:
+
+- The condition comes from `items.condition`. If nobody has recorded one, the card is *not ready* —
+  the app does not invent a condition for a buyer.
+- `items.original_or_vintage` is a three-valued fact: yes / no / not asserted. The card says
+  "Original or vintage: yes" or ": no" when the record says so, and says nothing at all when the
+  record does not. A "made by someone else" item is never rounded up to "vintage" — the same rule
+  Etsy enforces per item at write time.
+- The photos are on Emily's phone. Stoop does not host them for Facebook, so the card carries that
+  as an instruction to her and keeps it *out* of the pasted text.
+
+**The day-one breaker for this slice:** she taps **Mark sold** on the Facebook listing. The sale
+wins, every other listing ends with no human in the loop (`sold_on_facebook`), and a second
+real-world sale on another channel is recorded as `needs_refund` — never dropped, because the money
+moved even though the item did not.
+
+**One rule that fell out of it:** an item is editable only while it is live on no channel the app
+publishes to. eBay Inventory-API listings cannot be revised in Seller Hub, so the record they were
+published from has to stay true — the same reason the draft→approve→publish flow exists at all.
+
 ## Stack
 
 - Next.js (App Router) + Postgres, one service in the vps1 compose file (`/srv/compose.yml`).

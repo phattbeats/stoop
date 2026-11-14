@@ -9,6 +9,8 @@
 
 export type Marketplace = 'ebay' | 'etsy' | 'facebook';
 
+import { assertEditable, assertNotFacebookPublish } from './domain.ts';
+
 export type ItemStatus = 'draft' | 'published' | 'sold' | 'ended';
 
 export type ListingState = 'pending' | 'live' | 'ended';
@@ -28,6 +30,21 @@ export interface Item {
   priceCents: number;
   photos: string[];
   tags: string[];
+  /**
+   * The condition, as recorded. 'unspecified' means nobody has said — the
+   * Facebook card is blocked until a human says what it is.
+   */
+  condition: string;
+  /**
+   * true  — this record asserts the item is original or vintage;
+   * false — it asserts it is not;
+   * null  — not asserted either way.
+   *
+   * Etsy is original/vintage only and the Facebook card may never round a
+   * "made by someone else" item up to "vintage", so this is the truth the
+   * card is rendered from.
+   */
+  originalOrVintage: boolean | null;
   status: ItemStatus;
   createdAt: string;
 }
@@ -140,6 +157,8 @@ export class Ledger {
     priceCents: number;
     photos?: string[];
     tags?: string[];
+    condition?: string;
+    originalOrVintage?: boolean | null;
   }): Item {
     if (!this.sellers.has(input.sellerId)) {
       throw new Error(`unknown seller ${input.sellerId}`);
@@ -152,6 +171,8 @@ export class Ledger {
       priceCents: input.priceCents,
       photos: input.photos ?? [],
       tags: input.tags ?? [],
+      condition: input.condition ?? 'unspecified',
+      originalOrVintage: input.originalOrVintage ?? null,
       status: 'draft',
       createdAt: this.now(),
     };
@@ -184,6 +205,7 @@ export class Ledger {
     const item = this.items.get(itemId);
     if (!item) throw new Error(`unknown item ${itemId}`);
     if (item.status === 'sold') throw new Error(`item ${itemId} is sold; it cannot be published`);
+    assertNotFacebookPublish(marketplace);
 
     const existing = [...this.listings.values()].find(
       (l) => l.itemId === itemId && l.marketplace === marketplace && l.state !== 'ended',
@@ -205,6 +227,74 @@ export class Ledger {
     this.listings.set(listing.id, listing);
     item.status = 'published';
     return listing;
+  }
+
+  /**
+   * The "Posted on FB" tap.
+   *
+   * She pasted the card into Facebook and says it is up. There is no Facebook
+   * listing id to store — Stoop never touches Facebook — so the listing is a
+   * state: marketplace facebook, remote id null, live.
+   */
+  markPostedOnFacebook(itemId: string): Listing {
+    const item = this.items.get(itemId);
+    if (!item) throw new Error(`unknown item ${itemId}`);
+    if (item.status === 'sold') throw new Error(`item ${itemId} is sold; it cannot be published`);
+
+    const existing = [...this.listings.values()].find(
+      (l) => l.itemId === itemId && l.marketplace === 'facebook' && l.state !== 'ended',
+    );
+    if (existing) {
+      existing.state = 'live';
+      existing.remoteId = null;
+      return existing;
+    }
+
+    const listing: Listing = {
+      id: this.nextId('lst'),
+      itemId,
+      marketplace: 'facebook',
+      remoteId: null,
+      state: 'live',
+      createdAt: this.now(),
+    };
+    this.listings.set(listing.id, listing);
+    item.status = 'published';
+    return listing;
+  }
+
+  /**
+   * Edit the facts of an item that nothing else is published from yet.
+   *
+   * Once an item is live on eBay or Etsy the record is frozen: those
+   * listings cannot be revised in place, so the record they were published
+   * from has to stay true.
+   */
+  updateItem(
+    itemId: string,
+    patch: {
+      title?: string;
+      description?: string;
+      priceCents?: number;
+      condition?: string;
+      originalOrVintage?: boolean | null;
+    },
+  ): Item {
+    const item = this.items.get(itemId);
+    if (!item) throw new Error(`unknown item ${itemId}`);
+    assertEditable(item, [...this.listings.values()]);
+
+    if (patch.title !== undefined) item.title = patch.title.trim().slice(0, 140);
+    if (patch.description !== undefined) item.description = patch.description.trim().slice(0, 4000);
+    if (patch.priceCents !== undefined) {
+      if (!Number.isFinite(patch.priceCents) || patch.priceCents < 0) {
+        throw new Error('price must be a non-negative number of cents');
+      }
+      item.priceCents = Math.round(patch.priceCents);
+    }
+    if (patch.condition !== undefined) item.condition = patch.condition.trim().slice(0, 40) || 'unspecified';
+    if (patch.originalOrVintage !== undefined) item.originalOrVintage = patch.originalOrVintage;
+    return item;
   }
 
   /** End one listing by hand (seller pulled it). */

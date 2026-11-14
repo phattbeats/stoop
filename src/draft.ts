@@ -13,6 +13,7 @@
  */
 
 import type { Marketplace } from './ledger.ts';
+import { renderFacebookCard, type FacebookCard } from './facebook.ts';
 
 export type DraftStatus = 'draft' | 'approved' | 'rejected';
 
@@ -317,6 +318,8 @@ export interface ChannelDraft {
   /** False when a human has to do something before this can be published. */
   ready: boolean;
   blockers: string[];
+  /** Facebook only: the paste card. Absent for the channels we publish to. */
+  card?: FacebookCard;
 }
 
 /**
@@ -339,6 +342,29 @@ export function renderForMarketplace(
     blockers.push('etsy_requires_original_or_vintage');
   }
   if (price <= 0) blockers.push('price_missing');
+
+  // Facebook is a paste card, not a listing: Emily copies the text herself.
+  if (marketplace === 'facebook') {
+    const card = renderFacebookCard({
+      title: draft.title,
+      description: draft.description,
+      priceCents: price,
+      condition: draft.condition,
+      originalOrVintage: draft.originalOrVintage,
+      photoCount: draft.photos.length,
+    });
+    return {
+      marketplace,
+      title: truncate(stripMarkup(draft.title), limits.titleMax),
+      description: truncate(draft.description, limits.descriptionMax),
+      tags: [],
+      priceCents: price,
+      shipping: draft.shipping,
+      ready: blockers.length === 0 && card.ready,
+      blockers: [...new Set([...blockers, ...card.blockers])],
+      card,
+    };
+  }
 
   const title = truncate(draft.title, limits.titleMax);
   return {
@@ -381,6 +407,13 @@ export interface ApprovalOutcome {
     priceCents: number;
     tags: string[];
     photos: string[];
+    /**
+     * The facts travel with the item. The Facebook card is rendered from the
+     * item record, and Etsy is original/vintage only — a card that guessed
+     * would be a card that lied.
+     */
+    condition: string;
+    originalOrVintage: boolean | null;
   };
 }
 
@@ -419,6 +452,8 @@ export function approveDraft(draft: ListingDraft, input: ApprovalInput, now: str
       priceCents,
       tags: decided.tags,
       photos: decided.photos,
+      condition: decided.condition,
+      originalOrVintage: decided.originalOrVintage,
     },
   };
 }

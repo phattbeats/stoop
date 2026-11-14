@@ -26,6 +26,7 @@ import {
   reviewProposal,
   type ListingDraft,
 } from './draft.ts';
+import { renderFacebookCard, type FacebookCard } from './facebook.ts';
 import type { DraftStore } from './drafts.ts';
 import type { DraftPhoto, DraftRequest } from './llm.ts';
 import { DraftingError } from './llm.ts';
@@ -196,9 +197,23 @@ function itemView(item: ReturnType<Ledger['createItem']>): Record<string, unknow
     priceCents: item.priceCents,
     photos: item.photos,
     tags: item.tags,
+    condition: item.condition,
+    originalOrVintage: item.originalOrVintage,
     status: item.status,
     createdAt: item.createdAt,
   };
+}
+
+/** The Facebook paste card for one item, rendered from the item record. */
+function facebookCardFor(item: ReturnType<Ledger['createItem']>): FacebookCard {
+  return renderFacebookCard({
+    title: item.title,
+    description: item.description,
+    priceCents: item.priceCents,
+    condition: item.condition,
+    originalOrVintage: item.originalOrVintage,
+    photoCount: item.photos.length,
+  });
 }
 
 export function createApp(options: ServerOptions): {
@@ -309,10 +324,15 @@ export function createApp(options: ServerOptions): {
               priceCents: item.priceCents,
               status: item.status,
               photos: item.photos,
+              condition: item.condition,
+              originalOrVintage: item.originalOrVintage,
               sold: await ledger.isSold(item.id),
-              listings: itemListings
-                .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
-                .map((l) => ({ marketplace: l.marketplace, state: l.state })),
+              needsRefund: (await ledger.getDuplicateSales(item.id)).length > 0,
+              postedOnFacebook: itemListings.some(
+                (l) => l.marketplace === 'facebook' && l.state === 'live',
+              ),
+              card: facebookCardFor(item),
+              listings: itemListings.map((l) => ({ marketplace: l.marketplace, state: l.state })),
             };
           }),
         );
@@ -356,10 +376,17 @@ export function createApp(options: ServerOptions): {
               const itemListings = await ledger.listListings(item.id);
               return {
                 ...itemView(item),
-                listings: itemListings
-                  .filter((l) => l.marketplace !== 'facebook' || l.remoteId)
-                  .map((l) => ({ marketplace: l.marketplace, state: l.state, remoteId: l.remoteId })),
+                listings: itemListings.map((l) => ({
+                  marketplace: l.marketplace,
+                  state: l.state,
+                  remoteId: l.remoteId,
+                })),
                 sold: await ledger.isSold(item.id),
+                needsRefund: (await ledger.getDuplicateSales(item.id)).length > 0,
+                postedOnFacebook: itemListings.some(
+                  (l) => l.marketplace === 'facebook' && l.state === 'live',
+                ),
+                card: facebookCardFor(item),
               };
             }),
           );
@@ -392,8 +419,50 @@ export function createApp(options: ServerOptions): {
             tags: Array.isArray(body.tags)
               ? body.tags.filter((t): t is string => typeof t === 'string')
               : [],
+            condition: typeof body.condition === 'string' ? body.condition : 'unspecified',
+            originalOrVintage:
+              body.originalOrVintage === true
+                ? true
+                : body.originalOrVintage === false
+                  ? false
+                  : null,
           });
           json(res, 201, { item: itemView(item) });
+          return;
+        }
+
+        // PATCH /api/items/:id — the facts of an item nothing else is live from
+        const patchMatch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
+        if (req.method === 'PATCH' && patchMatch) {
+          const item = await ledger.getItem(patchMatch[1]);
+          if (!item || item.sellerId !== sellerId) {
+            json(res, 404, { error: 'item_not_found' });
+            return;
+          }
+          const body = await readJson(req);
+          const patch: {
+            title?: string;
+            description?: string;
+            priceCents?: number;
+            condition?: string;
+            originalOrVintage?: boolean | null;
+          } = {};
+          if (typeof body.title === 'string') patch.title = body.title;
+          if (typeof body.description === 'string') patch.description = body.description;
+          if (body.priceCents !== undefined && body.priceCents !== null) {
+            const priceCents = Number(body.priceCents);
+            if (!Number.isFinite(priceCents) || priceCents < 0) {
+              json(res, 400, { error: 'price_cents_invalid' });
+              return;
+            }
+            patch.priceCents = Math.round(priceCents);
+          }
+          if (typeof body.condition === 'string') patch.condition = body.condition;
+          if (body.originalOrVintage === true || body.originalOrVintage === false) {
+            patch.originalOrVintage = body.originalOrVintage;
+          }
+          const updated = await ledger.updateItem(item.id, patch);
+          json(res, 200, { item: itemView(updated), card: facebookCardFor(updated) });
           return;
         }
 
@@ -411,9 +480,39 @@ export function createApp(options: ServerOptions): {
             json(res, 400, { error: 'unknown_marketplace' });
             return;
           }
+          if (marketplace === 'facebook') {
+            // Facebook is a paste card, not a listing Stoop can create.
+            json(res, 400, { error: 'facebook_requires_paste_card' });
+            return;
+          }
           const remoteId = typeof body.remoteId === 'string' ? body.remoteId : null;
           const listing = await ledger.publish(item.id, marketplace, remoteId);
           json(res, 200, { listing });
+          return;
+        }
+
+        // GET /api/items/:id/facebook-card — the text she pastes
+        const cardMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/facebook-card$/);
+        if (req.method === 'GET' && cardMatch) {
+          const item = await ledger.getItem(cardMatch[1]);
+          if (!item || item.sellerId !== sellerId) {
+            json(res, 404, { error: 'item_not_found' });
+            return;
+          }
+          json(res, 200, { card: facebookCardFor(item) });
+          return;
+        }
+
+        // POST /api/items/:id/facebook/posted — she pasted it, it is up
+        const postedMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/facebook\/posted$/);
+        if (req.method === 'POST' && postedMatch) {
+          const item = await ledger.getItem(postedMatch[1]);
+          if (!item || item.sellerId !== sellerId) {
+            json(res, 404, { error: 'item_not_found' });
+            return;
+          }
+          const listing = await ledger.markPostedOnFacebook(item.id);
+          json(res, 200, { listing, card: facebookCardFor(item) });
           return;
         }
 
@@ -426,10 +525,22 @@ export function createApp(options: ServerOptions): {
             return;
           }
           const result = await ledger.markSold(item.id, `manual_${item.id}`);
+          const duplicates = await ledger.getDuplicateSales(item.id);
           json(res, 200, {
             outcome: result.outcome,
             endedListings: result.endedListings.length,
-            needsRefund: result.needsRefund,
+            ended: result.endedListings.map((l) => ({
+              marketplace: l.marketplace,
+              state: l.state,
+              endReason: l.endReason,
+            })),
+            needsRefund: result.needsRefund || duplicates.length > 0,
+            refunds: duplicates.map((sale) => ({
+              marketplace: sale.marketplace,
+              orderId: sale.orderId,
+              amountCents: sale.amountCents,
+            })),
+            sold: true,
           });
           return;
         }
@@ -565,6 +676,8 @@ export function createApp(options: ServerOptions): {
             priceCents: outcome.item.priceCents,
             photos: outcome.item.photos,
             tags: outcome.item.tags,
+            condition: outcome.item.condition,
+            originalOrVintage: outcome.item.originalOrVintage,
           });
           outcome.draft.itemId = item.id;
           await drafts.save(outcome.draft);

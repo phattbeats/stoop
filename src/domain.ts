@@ -15,6 +15,49 @@ import type { Item, Listing, ListingState, Marketplace, Sale } from './ledger.ts
 export const MARKETPLACES: readonly Marketplace[] = ['ebay', 'etsy', 'facebook'];
 
 /**
+ * There is no Facebook listing id, because Stoop never touches Facebook.
+ *
+ * The Facebook path is a paste card and a tap. A listing on Facebook is a
+ * *state* (she posted it), not a remote resource we hold an id for, so
+ * `remote_id` stays null and stays null forever.
+ */
+export const FACEBOOK_REMOTE_ID: string | null = null;
+
+/**
+ * Facebook is not a publishable channel.
+ *
+ * The card is the only way an item reaches Facebook, and "Posted on FB" is
+ * the only way the app learns about it. Publishing there would claim a
+ * listing Stoop did not create and cannot manage.
+ */
+export function assertNotFacebookPublish(marketplace: Marketplace): void {
+  if (marketplace === 'facebook') {
+    throw new Error('facebook is a paste card: mark it posted instead of publishing');
+  }
+}
+
+/**
+ * An item may be edited only while no channel the app publishes to is live.
+ *
+ * eBay Inventory-API listings cannot be revised in Seller Hub, so once an
+ * item is on eBay or Etsy the record it was published from is frozen —
+ * otherwise the app would be holding a record that no longer matches the
+ * listing a buyer can see. A Facebook paste card does not freeze anything:
+ * Emily edits the Facebook post herself.
+ */
+export function assertEditable(item: Pick<Item, 'id' | 'status'>, listings: Listing[]): void {
+  if (item.status === 'sold') {
+    throw new Error(`item ${item.id} is sold; it cannot be edited`);
+  }
+  const liveElsewhere = listings.some(
+    (l) => l.itemId === item.id && l.state !== 'ended' && l.marketplace !== 'facebook',
+  );
+  if (liveElsewhere) {
+    throw new Error(`item ${item.id} is live on another marketplace; it cannot be edited`);
+  }
+}
+
+/**
  * A sale needs a receipt. We do not decrement stock because a webhook arrived;
  * we decrement it because a receipt says sold.
  */

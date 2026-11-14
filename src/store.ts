@@ -14,6 +14,8 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Item, Listing, Marketplace, Sale, SaleResult, SaleSignal, Seller } from './ledger.ts';
 import {
+  assertEditable,
+  assertNotFacebookPublish,
   assertPublishable,
   cleanPhotos,
   cleanTags,
@@ -30,6 +32,8 @@ interface ItemRow {
   price_cents: number;
   photos: unknown;
   tags: string[] | null;
+  condition: string;
+  original_or_vintage: boolean | null;
   status: Item['status'];
   created_at: Date;
 }
@@ -63,6 +67,8 @@ function toItem(row: ItemRow): Item {
     priceCents: row.price_cents,
     photos,
     tags: row.tags ?? [],
+    condition: row.condition,
+    originalOrVintage: row.original_or_vintage,
     status: row.status,
     createdAt: new Date(row.created_at).toISOString(),
   };
@@ -131,11 +137,13 @@ export class PgLedger {
     priceCents: number;
     photos?: string[];
     tags?: string[];
+    condition?: string;
+    originalOrVintage?: boolean | null;
   }): Promise<Item> {
     const result = await this.pool.query<ItemRow>(
-      `INSERT INTO items (seller_id, title, description, price_cents, photos, tags, status)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, 'draft')
-         RETURNING id, seller_id, title, description, price_cents, photos, tags, status, created_at`,
+      `INSERT INTO items (seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, 'draft')
+         RETURNING id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at`,
       [
         input.sellerId,
         input.title,
@@ -143,6 +151,8 @@ export class PgLedger {
         input.priceCents,
         JSON.stringify(cleanPhotos(input.photos)),
         cleanTags(input.tags),
+        input.condition ?? 'unspecified',
+        input.originalOrVintage ?? null,
       ],
     );
     return toItem(result.rows[0]);
@@ -150,7 +160,7 @@ export class PgLedger {
 
   async getItem(id: string): Promise<Item | undefined> {
     const result = await this.pool.query<ItemRow>(
-      `SELECT id, seller_id, title, description, price_cents, photos, tags, status, created_at
+      `SELECT id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at
          FROM items WHERE id = $1`,
       [id],
     );
@@ -160,15 +170,66 @@ export class PgLedger {
   async listItems(sellerId?: string): Promise<Item[]> {
     const result = sellerId
       ? await this.pool.query<ItemRow>(
-          `SELECT id, seller_id, title, description, price_cents, photos, tags, status, created_at
+          `SELECT id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at
              FROM items WHERE seller_id = $1 ORDER BY created_at DESC`,
           [sellerId],
         )
       : await this.pool.query<ItemRow>(
-          `SELECT id, seller_id, title, description, price_cents, photos, tags, status, created_at
+          `SELECT id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at
              FROM items ORDER BY created_at DESC`,
         );
     return result.rows.map(toItem);
+  }
+
+  /**
+   * Edit the facts of an item that nothing else is published from yet.
+   *
+   * Once an item is live on eBay or Etsy the record is frozen: those
+   * listings cannot be revised in place, so the record they were published
+   * from has to stay true.
+   */
+  async updateItem(
+    itemId: string,
+    patch: {
+      title?: string;
+      description?: string;
+      priceCents?: number;
+      condition?: string;
+      originalOrVintage?: boolean | null;
+    },
+  ): Promise<Item> {
+    const item = await this.getItem(itemId);
+    if (!item) throw new Error(`unknown item ${itemId}`);
+    const listings = await this.listListings(itemId);
+    assertEditable(item, listings);
+
+    const title = patch.title !== undefined ? patch.title.trim().slice(0, 140) : item.title;
+    const description =
+      patch.description !== undefined ? patch.description.trim().slice(0, 4000) : item.description;
+    const priceCents =
+      patch.priceCents !== undefined
+        ? (() => {
+            if (!Number.isFinite(patch.priceCents) || (patch.priceCents as number) < 0) {
+              throw new Error('price must be a non-negative number of cents');
+            }
+            return Math.round(patch.priceCents as number);
+          })()
+        : item.priceCents;
+    const condition =
+      patch.condition !== undefined
+        ? patch.condition.trim().slice(0, 40) || 'unspecified'
+        : item.condition;
+    const originalOrVintage =
+      patch.originalOrVintage !== undefined ? patch.originalOrVintage : item.originalOrVintage;
+
+    const result = await this.pool.query<ItemRow>(
+      `UPDATE items
+          SET title = $2, description = $3, price_cents = $4, condition = $5, original_or_vintage = $6
+        WHERE id = $1
+        RETURNING id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at`,
+      [itemId, title, description, priceCents, condition, originalOrVintage],
+    );
+    return toItem(result.rows[0]);
   }
 
   // ── listings ───────────────────────────────────────────────────────────────
@@ -201,6 +262,7 @@ export class PgLedger {
       const item = await this.fetchItem(client, itemId);
       if (!item) throw new Error(`unknown item ${itemId}`);
       assertPublishable(item);
+      assertNotFacebookPublish(marketplace);
 
       const result = await client.query<ListingRow>(
         `INSERT INTO listings (item_id, marketplace, remote_id, state)
@@ -212,6 +274,43 @@ export class PgLedger {
                        end_reason = NULL
            RETURNING id, item_id, marketplace, remote_id, state, created_at, ended_at, end_reason`,
         [itemId, marketplace, remoteId],
+      );
+      await client.query(`UPDATE items SET status = 'published' WHERE id = $1`, [itemId]);
+      await client.query('COMMIT');
+      return toListing(result.rows[0]);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * The "Posted on FB" tap.
+   *
+   * She pasted the card into Facebook and says it is up. There is no Facebook
+   * listing id to store — Stoop never touches Facebook — so the listing is a
+   * state: marketplace facebook, remote id null, live.
+   */
+  async markPostedOnFacebook(itemId: string): Promise<Listing> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const item = await this.fetchItem(client, itemId);
+      if (!item) throw new Error(`unknown item ${itemId}`);
+      assertPublishable(item);
+
+      const result = await client.query<ListingRow>(
+        `INSERT INTO listings (item_id, marketplace, remote_id, state)
+              VALUES ($1, 'facebook', NULL, 'live')
+         ON CONFLICT (item_id, marketplace)
+         DO UPDATE SET remote_id = NULL,
+                       state = 'live',
+                       ended_at = NULL,
+                       end_reason = NULL
+           RETURNING id, item_id, marketplace, remote_id, state, created_at, ended_at, end_reason`,
+        [itemId],
       );
       await client.query(`UPDATE items SET status = 'published' WHERE id = $1`, [itemId]);
       await client.query('COMMIT');
@@ -426,7 +525,7 @@ export class PgLedger {
 
   private async fetchItem(client: PoolClient, itemId: string): Promise<Item | undefined> {
     const result = await client.query<ItemRow>(
-      `SELECT id, seller_id, title, description, price_cents, photos, tags, status, created_at
+      `SELECT id, seller_id, title, description, price_cents, photos, tags, condition, original_or_vintage, status, created_at
          FROM items WHERE id = $1`,
       [itemId],
     );
