@@ -18,6 +18,8 @@ import { AnthropicPathDrafter } from './llm.ts';
 import { EtsyAdapter, EtsyClient } from './etsy.ts';
 import { EBayAdapter } from './ebay.ts';
 import { EBayClient } from './ebay-client.ts';
+import { EBayService } from './ebay-service.ts';
+import { EBayTokenManager, PgEBayTokenStore } from './ebay-store.ts';
 import { EtsyService } from './etsy-service.ts';
 import type { EtsySaleLedger } from './etsy-service.ts';
 import { EtsyTokenManager, PgEtsyTokenStore, PgRemoteActionStore } from './etsy-store.ts';
@@ -63,6 +65,7 @@ const drafter = config.llmApiKey
 const remoteActions = new PgRemoteActionStore(pool);
 const adapters: Partial<Record<Marketplace, MarketplaceAdapter>> = {};
 let etsyService: EtsyService | undefined;
+let ebayService: EBayService | undefined;
 
 // ── eBay (PHA-5093) ──────────────────────────────────────────────────────────
 //
@@ -81,9 +84,11 @@ if (config.ebay) {
     marketplaceId: config.ebay.marketplaceId,
     ...(config.ebay.refreshToken ? { refreshToken: config.ebay.refreshToken } : {}),
   });
+  const tokenStore = new PgEBayTokenStore(pool);
+  const tokenManager = new EBayTokenManager(client, tokenStore, config.ebay.environment);
   const adapter = new EBayAdapter(
     client,
-    { accessToken: () => client.accessToken() },
+    tokenManager,
     {
       inventoryLocationId: config.ebay.inventoryLocationId ?? '',
       categoryId: config.ebay.categoryId ?? '',
@@ -94,6 +99,15 @@ if (config.ebay) {
     },
   );
   adapters.ebay = adapter;
+
+  ebayService = new EBayService({
+    client,
+    adapter,
+    tokenStore,
+    environment: config.ebay.environment,
+    redirectUri: config.ebay.redirectUri,
+    scope: config.ebay.scope,
+  });
 }
 
 if (config.etsy) {
@@ -146,6 +160,7 @@ const { server } = createApp({
   photosDir: config.photosDir,
   ...(etsyService ? { etsy: etsyService } : {}),
   ...(adapters.ebay ? { ebay: adapters.ebay } : {}),
+  ...(ebayService ? { ebayService } : {}),
   remoteActions,
   delist: new DelistRunner(remoteActions, adapters),
   sessionSecret: config.sessionSecret,

@@ -12,6 +12,7 @@ import { Pool } from 'pg';
 import { Ledger } from '../src/ledger.ts';
 import { PgLedger } from '../src/store.ts';
 import { PgEtsyTokenStore, PgRemoteActionStore } from '../src/etsy-store.ts';
+import { PgEBayTokenStore } from '../src/ebay-store.ts';
 
 const databaseUrl = process.env.STOOP_DATABASE_URL;
 const integration = databaseUrl ? test : test.skip;
@@ -315,4 +316,52 @@ integration('the Postgres Etsy token store and remote action queue behave', asyn
   await actions.markSucceeded(first.id, { alreadyGone: true });
   const stillOpen = await actions.listOpen();
   assert.equal(stillOpen.find((a) => a.id === first.id), undefined);
+});
+
+integration('the Postgres eBay token store keeps the environments apart', async (t) => {
+  const pool = new Pool({ connectionString: databaseUrl });
+  const tokens = new PgEBayTokenStore(pool);
+
+  const stamp = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const ledger = new PgLedger(pool);
+  const seller = await ledger.addSeller({ id: 'ignored', authUserId: `auth-${stamp}`, displayName: 'Emily' });
+
+  t.after(async () => {
+    await pool.query(`DELETE FROM sellers WHERE auth_user_id LIKE $1`, [`%${stamp}`]);
+    await pool.end();
+  });
+
+  const saved = await tokens.save(seller.id, 'sandbox', {
+    accessToken: 'sandbox.access',
+    tokenType: 'Bearer',
+    refreshToken: 'sandbox.refresh',
+    expiresIn: 7200,
+    scope: 'https://api.ebay.com/oauth/api_scope',
+    sellerUserId: 'seller-42',
+  });
+
+  assert.equal(saved.environment, 'sandbox');
+  assert.equal(saved.sellerUserId, 'seller-42');
+  assert.ok(Date.parse(saved.accessExpiresAt) > Date.now());
+  assert.ok(Date.parse(saved.refreshExpiresAt) > Date.parse(saved.accessExpiresAt));
+
+  // The sandbox token is found in the sandbox.
+  assert.equal((await tokens.get(seller.id, 'sandbox'))?.accessToken, 'sandbox.access');
+  assert.equal((await tokens.first('sandbox'))?.sellerId, seller.id);
+
+  // And it is NOT found in production. A sandbox token used against
+  // production would publish into the wrong store.
+  assert.equal(await tokens.get(seller.id, 'production'), undefined);
+  assert.equal(await tokens.first('production'), undefined);
+
+  // Re-consenting replaces the tokens rather than adding a second row.
+  const again = await tokens.save(seller.id, 'sandbox', {
+    accessToken: 'sandbox.access.2',
+    tokenType: 'Bearer',
+    refreshToken: 'sandbox.refresh.2',
+    expiresIn: 7200,
+  });
+  assert.equal(again.accessToken, 'sandbox.access.2');
+  assert.equal((await tokens.get(seller.id, 'sandbox'))?.accessToken, 'sandbox.access.2');
+  assert.equal(again.sellerUserId, 'seller-42', 'the seller id survives a refresh');
 });

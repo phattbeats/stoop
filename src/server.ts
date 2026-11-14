@@ -38,6 +38,7 @@ import type { DraftPhoto, DraftRequest } from './llm.ts';
 import { DraftingError } from './llm.ts';
 import { EtsyError, EtsyPolicyError } from './etsy.ts';
 import { EBayError, EBayPolicyError } from './ebay-client.ts';
+import type { EBayService } from './ebay-service.ts';
 import type { MarketplaceAdapter, PublishImage } from './adapter.ts';
 import { EtsyDeliveryError, type EtsyService } from './etsy-service.ts';
 import type { RemoteActionStore } from './etsy-store.ts';
@@ -45,6 +46,9 @@ import type { DelistRunner } from './sync.ts';
 
 /** The cookie that carries the Etsy consent attempt across the redirect. */
 const ETSY_STATE_COOKIE = 'stoop_etsy_oauth';
+
+/** The cookie that carries the eBay consent attempt across the redirect. */
+const EBAY_STATE_COOKIE = 'stoop_ebay_oauth';
 
 export interface Session {
   authUserId: string;
@@ -68,6 +72,8 @@ export interface ServerOptions {
   etsy?: EtsyService;
   /** The eBay side: the Sell Inventory offer flow. */
   ebay?: MarketplaceAdapter;
+  /** The eBay consent flow. Emily connects her own account. */
+  ebayService?: EBayService;
   /** The queue of remote actions a human may have to finish by hand. */
   remoteActions?: RemoteActionStore;
   /** Ends the other channels' listings when an item sells. */
@@ -286,6 +292,7 @@ export function createApp(options: ServerOptions): {
   const photosDir = options.photosDir ?? '/srv/appdata/stoop/photos';
   const etsy = options.etsy;
   const ebay = options.ebay;
+  const ebayService = options.ebayService;
   const remoteActions = options.remoteActions;
   const delist = options.delist;
   const sessionSecret = options.sessionSecret;
@@ -524,6 +531,64 @@ export function createApp(options: ServerOptions): {
             await etsy.completeAuthorization(sellerId, code, saved.verifier);
           } catch (error) {
             json(res, 502, { error: 'etsy_connect_failed', detail: String((error as Error).message ?? error) });
+            return;
+          }
+          res.writeHead(302, { location: '/' });
+          res.end();
+          return;
+        }
+
+        // GET /api/ebay/connect — send Emily to eBay to consent herself.
+        if (req.method === 'GET' && url.pathname === '/api/ebay/connect') {
+          if (!ebayService) {
+            json(res, 503, { error: 'ebay_not_configured' });
+            return;
+          }
+          if (!sessionSecret) {
+            json(res, 503, { error: 'session_secret_missing' });
+            return;
+          }
+          const state = randomBytes(24).toString('base64url');
+          const verifier = randomBytes(32).toString('base64url');
+          const challenge = createHash('sha256').update(verifier).digest('base64url');
+          const cookie = encodeLoginState(
+            { state, nonce: state, verifier, ts: Date.now() },
+            sessionSecret,
+          );
+          res.writeHead(302, {
+            location: ebayService.authorizationUrl(state, challenge),
+            'set-cookie': serializeCookie(EBAY_STATE_COOKIE, cookie, { maxAgeSeconds: 600 }),
+          });
+          res.end();
+          return;
+        }
+
+        // GET /api/ebay/callback — eBay sends the seller back with a code.
+        if (req.method === 'GET' && url.pathname === '/api/ebay/callback') {
+          if (!ebayService) {
+            json(res, 503, { error: 'ebay_not_configured' });
+            return;
+          }
+          if (!sessionSecret) {
+            json(res, 503, { error: 'session_secret_missing' });
+            return;
+          }
+          const code = url.searchParams.get('code') ?? '';
+          const state = url.searchParams.get('state') ?? '';
+          const saved = decodeLoginState(readCookie(req, EBAY_STATE_COOKIE) ?? undefined, sessionSecret);
+          // The state has to come back unchanged. Without that check, a
+          // callback could be replayed with someone else's code.
+          if (!code || !saved || saved.state !== state) {
+            json(res, 400, { error: 'ebay_callback_invalid' });
+            return;
+          }
+          try {
+            await ebayService.completeAuthorization(sellerId, code, saved.verifier);
+          } catch (error) {
+            json(res, 502, {
+              error: 'ebay_connect_failed',
+              detail: String((error as Error).message ?? error),
+            });
             return;
           }
           res.writeHead(302, { location: '/' });

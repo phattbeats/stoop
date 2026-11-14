@@ -105,6 +105,8 @@ export interface EBayTokens {
   expiresIn: number;
   /** Only the authorization-code grant returns one. */
   refreshToken?: string;
+  /** The scope eBay says the token actually carries. */
+  scope?: string;
 }
 
 export interface EBayClientOptions {
@@ -241,6 +243,35 @@ export class EBayClient {
     const body = new URLSearchParams({ grant_type: 'client_credentials' });
     if (scope) body.set('scope', scope);
     return this.requestTokens(body);
+  }
+
+  /**
+   * The seller behind a token.
+   *
+   * eBay's identity service answers with the user id, and it is the only
+   * place that knows it — the token response does not carry it. The call
+   * needs its own scope, because the seller's own token is scoped to the
+   * Sell APIs, not to identity.
+   */
+  async sellerUserId(accessToken: string): Promise<string | undefined> {
+    const response = await this.fetchImpl(`${this.baseUrl}/identity/v1/userinfo`, {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${accessToken}`,
+        accept: 'application/json',
+        'x-ebay-c-marketplace-id': this.options.marketplaceId ?? EBAY_MARKETPLACE.M_US,
+      },
+    });
+    if (!response.ok) {
+      throw new EBayError(
+        `ebay could not identify the seller (${response.status})`,
+        response.status,
+        (await response.text()).slice(0, 400),
+      );
+    }
+    const payload = (await response.json()) as Record<string, unknown>;
+    const id = payload.user_id ?? payload.username;
+    return id ? String(id) : undefined;
   }
 
   /**
@@ -404,6 +435,7 @@ export class EBayClient {
       expiresIn: Number(payload.expires_in ?? 7200),
     };
     if (typeof payload.refresh_token === 'string' && payload.refresh_token) tokens.refreshToken = payload.refresh_token;
+    if (typeof payload.scope === 'string' && payload.scope) tokens.scope = payload.scope;
     return tokens;
   }
 }
