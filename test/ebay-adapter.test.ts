@@ -181,6 +181,68 @@ test('the inventory item carries the locale eBay needs on the product', async ()
   assert.equal(body.product.locale, 'en-US');
 });
 
+test('the photos go on the listing as URLs, because eBay downloads them', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl);
+
+  await adapter.publish(
+    publishRequest({
+      images: [
+        {
+          data: Buffer.from([0xff, 0xd8]),
+          contentType: 'image/jpeg',
+          url: 'https://stoop.phatt.vip/media/one.jpg',
+        },
+        {
+          data: Buffer.from([0xff, 0xd8]),
+          contentType: 'image/jpeg',
+          url: 'https://stoop.phatt.vip/media/two.jpg',
+        },
+      ],
+    }),
+  );
+
+  const itemCall = calls.find((c) => c.url.includes('/inventory_items'));
+  const body = JSON.parse(String(itemCall?.body));
+  assert.deepEqual(body.product.imageUrls, [
+    'https://stoop.phatt.vip/media/one.jpg',
+    'https://stoop.phatt.vip/media/two.jpg',
+  ]);
+});
+
+test('a photo with no URL is left off, rather than sent as something eBay cannot fetch', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl);
+
+  await adapter.publish(
+    publishRequest({
+      images: [{ data: Buffer.from([0xff, 0xd8]), contentType: 'image/jpeg' }],
+    }),
+  );
+
+  const itemCall = calls.find((c) => c.url.includes('/inventory_items'));
+  const body = JSON.parse(String(itemCall?.body));
+  assert.deepEqual(body.product.imageUrls, []);
+});
+
+test('the same URL is not sent twice', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl);
+
+  await adapter.publish(
+    publishRequest({
+      images: [
+        { data: Buffer.from([1]), contentType: 'image/jpeg', url: 'https://stoop.phatt.vip/media/one.jpg' },
+        { data: Buffer.from([2]), contentType: 'image/jpeg', url: 'https://stoop.phatt.vip/media/one.jpg' },
+      ],
+    }),
+  );
+
+  const itemCall = calls.find((c) => c.url.includes('/inventory_items'));
+  const body = JSON.parse(String(itemCall?.body));
+  assert.equal(body.product.imageUrls.length, 1);
+});
+
 test('the marketplace can be set explicitly and is not guessed', async () => {
   const { impl, calls } = happyPath();
   const { adapter } = adapterWith(impl, { marketplace: 'EBAY_GB' });

@@ -6,6 +6,8 @@
  * that needs a mouse.
  */
 
+import { photoPath } from './photos.ts';
+
 export interface PendingDraft {
   id: string;
   title: string;
@@ -123,8 +125,11 @@ export function renderShell(options: {
       const badges = live.length
         ? live.map((m) => `<span class="badge">${escapeHtml(m)}</span>`).join('')
         : '<span class="badge dim">not published</span>';
-      const photo = item.photos[0]
-        ? `<img src="${escapeHtml(item.photos[0])}" alt="">`
+      // The stored reference is a file name or a path on the box; the
+      // browser needs the path the app serves it from.
+      const photoSrc = item.photos[0] ? photoPath(item.photos[0]) : undefined;
+      const photo = photoSrc
+        ? `<img src="${escapeHtml(photoSrc)}" alt="">`
         : '<div class="ph"></div>';
       const sold = item.sold ? '<span class="badge sold">sold</span>' : '';
       const refund = item.needsRefund ? '<span class="badge refund">refund needed</span>' : '';

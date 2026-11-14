@@ -40,6 +40,7 @@ import { EtsyError, EtsyPolicyError } from './etsy.ts';
 import { EBayError, EBayPolicyError } from './ebay-client.ts';
 import type { EBayService } from './ebay-service.ts';
 import type { EBayOrderSync } from './ebay-orders.ts';
+import { PHOTO_CONTENT_TYPES, PHOTO_PATH_PREFIX, absolutePhotoUrl, photoNameOf } from './photos.ts';
 import type { MarketplaceAdapter, PublishImage } from './adapter.ts';
 import { EtsyDeliveryError, type EtsyService } from './etsy-service.ts';
 import type { RemoteActionStore } from './etsy-store.ts';
@@ -69,6 +70,11 @@ export interface ServerOptions {
   drafter?: Drafter;
   /** Where Emily's photos live on the box. */
   photosDir?: string;
+  /**
+   * This app's public address. eBay downloads a listing photo by URL, so
+   * the app has to know its own name on the internet.
+   */
+  publicUrl?: string;
   /** The Etsy side: publish, connect, and the paid-order webhook. */
   etsy?: EtsyService;
   /** The eBay side: the Sell Inventory offer flow. */
@@ -238,7 +244,8 @@ async function saveUploads(form: FormData, photosDir: string): Promise<string[]>
 async function readLocalImage(
   ref: string,
   photosDir: string,
-): Promise<{ data: Buffer; contentType: string } | null> {
+  publicUrl = '',
+): Promise<{ data: Buffer; contentType: string; url?: string } | null> {
   const trimmed = ref.trim();
   if (!trimmed || /^https?:\/\//i.test(trimmed) || /^data:/i.test(trimmed)) return null;
   const root = resolve(photosDir);
@@ -250,7 +257,10 @@ async function readLocalImage(
     const bytes = await readFile(full);
     const ext = basename(full).toLowerCase().slice(basename(full).toLowerCase().lastIndexOf('.'));
     const contentType = MEDIA_TYPES[`.${ext}`] ?? 'image/jpeg';
-    return { data: bytes, contentType };
+    // The same photo also needs a URL for a marketplace that downloads the
+    // picture itself.
+    const url = absolutePhotoUrl(trimmed, publicUrl);
+    return { data: bytes, contentType, ...(url ? { url } : {}) };
   } catch {
     return null;
   }
@@ -293,6 +303,7 @@ export function createApp(options: ServerOptions): {
   const drafts = options.drafts;
   const drafter = options.drafter;
   const photosDir = options.photosDir ?? '/srv/appdata/stoop/photos';
+  const publicUrl = options.publicUrl ?? '';
   const etsy = options.etsy;
   const ebay = options.ebay;
   const ebayService = options.ebayService;
@@ -322,6 +333,41 @@ export function createApp(options: ServerOptions): {
 
       if (req.method === 'GET' && url.pathname === '/healthz') {
         json(res, 200, { ok: true });
+        return;
+      }
+
+      // ── The photos (PHA-5093) ───────────────────────────────────────────────
+      //
+      // Public and unauthenticated on purpose: eBay downloads a listing
+      // photo by URL, so the picture has to be reachable from the internet
+      // with no session. What makes it safe is that the file name is a
+      // random UUID, only plain file names are served, and nothing outside
+      // the photos directory can be reached.
+      if (req.method === 'GET' && url.pathname.startsWith(PHOTO_PATH_PREFIX)) {
+        const name = photoNameOf(url.pathname.slice(PHOTO_PATH_PREFIX.length));
+        if (!name) {
+          json(res, 404, { error: 'photo_not_found' });
+          return;
+        }
+        const root = resolve(photosDir);
+        const full = resolve(root, name);
+        if (full !== root && !full.startsWith(`${root}/`)) {
+          json(res, 404, { error: 'photo_not_found' });
+          return;
+        }
+        const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+        try {
+          const bytes = await readFile(full);
+          res.writeHead(200, {
+            'content-type': PHOTO_CONTENT_TYPES[ext] ?? 'application/octet-stream',
+            'content-length': String(bytes.length),
+            // The name never changes, so it can be cached forever.
+            'cache-control': 'public, max-age=31536000, immutable',
+          });
+          res.end(bytes);
+        } catch {
+          json(res, 404, { error: 'photo_not_found' });
+        }
         return;
       }
 
@@ -789,7 +835,7 @@ export function createApp(options: ServerOptions): {
             }
             const images: PublishImage[] = [];
             for (const ref of item.photos) {
-              const image = await readLocalImage(ref, photosDir);
+              const image = await readLocalImage(ref, photosDir, publicUrl);
               if (image) images.push(image);
             }
             try {
@@ -842,7 +888,7 @@ export function createApp(options: ServerOptions): {
             }
             const images = [];
             for (const ref of item.photos) {
-              const image = await readLocalImage(ref, photosDir);
+              const image = await readLocalImage(ref, photosDir, publicUrl);
               if (image) images.push(image);
             }
             try {

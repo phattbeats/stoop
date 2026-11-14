@@ -14,10 +14,20 @@
 
 import type { Marketplace } from './ledger.ts';
 
-/** A photo to publish. Bytes, not a path: the adapter does not know the disk. */
+/**
+ * A photo to publish.
+ *
+ * Bytes, not a path: the adapter does not know the disk. But also a URL,
+ * because the two marketplaces want different things — Etsy uploads the
+ * bytes, and eBay downloads the picture from a URL itself. The URL is
+ * optional: a marketplace that needs it refuses the listing when it is
+ * missing.
+ */
 export interface PublishImage {
   data: Buffer;
   contentType: string;
+  /** Where this same photo is reachable from the public internet. */
+  url?: string;
 }
 
 /**

@@ -61,6 +61,12 @@ export interface EBayAdapterOptions {
    */
   marketplace?: string;
   /**
+   * This app's public address, so a photo on the box can be given to eBay
+   * as a URL. eBay downloads the picture itself — it does not accept bytes —
+   * so a listing with no reachable URL has no picture.
+   */
+  publicUrl?: string;
+  /**
    * The item's condition. eBay will not accept an offer without one; the
    * seller chooses it per item, and a one-off print that has never been
    * hung is 'NEW'.
@@ -145,6 +151,7 @@ export class EBayAdapter implements MarketplaceAdapter {
     // 1. The inventory item — what the thing is. Created first because the
     //    offer references it by id.
     const sku = EBayAdapter.skuFor(request.itemId);
+    const imageUrls = this.imageUrlsFor(request);
     const inventoryItem = await this.client.request(
       '/sell/inventory/v1/inventory_items',
       {
@@ -156,7 +163,7 @@ export class EBayAdapter implements MarketplaceAdapter {
             description: request.description.trim().slice(0, 1000),
             brand: 'Unbranded',
             aspects: {},
-            imageUrls: [],
+            imageUrls,
             inventoryLocationId: this.options.inventoryLocationId,
             sellerSKU: sku,
             // eBay needs the locale on the product, not on the offer.
@@ -267,6 +274,22 @@ export class EBayAdapter implements MarketplaceAdapter {
       }
       throw error;
     }
+  }
+
+  /**
+   * The picture URLs for the listing.
+   *
+   * eBay downloads the picture itself — it does not accept bytes — so a
+   * photo with no reachable URL cannot go on the listing. The app builds
+   * the URL when it reads the photo; this just collects them.
+   */
+  private imageUrlsFor(request: PublishRequest): string[] {
+    const urls: string[] = [];
+    for (const image of request.images) {
+      const url = image.url?.trim();
+      if (url && !urls.includes(url)) urls.push(url);
+    }
+    return urls.slice(0, 12);
   }
 
   private async readOffer(offerId: string, accessToken: string): Promise<any> {

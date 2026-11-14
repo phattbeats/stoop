@@ -98,6 +98,7 @@ if (config.ebay) {
       paymentPolicyId: config.ebay.paymentPolicyId ?? '',
       returnPolicyId: config.ebay.returnPolicyId ?? '',
       marketplace: config.ebay.offerMarketplace ?? 'EBAY_US',
+      publicUrl: config.publicUrl,
     },
   );
   adapters.ebay = adapter;
@@ -170,6 +171,7 @@ const { server } = createApp({
   drafts,
   ...(drafter ? { drafter } : {}),
   photosDir: config.photosDir,
+  publicUrl: config.publicUrl,
   ...(etsyService ? { etsy: etsyService } : {}),
   ...(adapters.ebay ? { ebay: adapters.ebay } : {}),
   ...(ebayService ? { ebayService } : {}),
