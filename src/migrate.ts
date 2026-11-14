@@ -19,7 +19,19 @@ export async function migrate(pool: Pool, log: (message: string) => void = conso
     applied_at timestamptz NOT NULL DEFAULT now()
   )`);
 
-  const files = (await readdir(dbDir)).filter((file) => file.endsWith('.sql')).sort();
+  // Base schema first (files with no numeric prefix), then numbered migrations
+  // in numeric order. "schema.sql" then "002_sessions.sql".
+  const files = (await readdir(dbDir))
+    .filter((file) => file.endsWith('.sql'))
+    .sort((a, b) => {
+      const rank = (name: string) => {
+        const match = /^(\d+)/.exec(name);
+        return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+      };
+      const rankDelta = rank(a) - rank(b);
+      if (rankDelta !== 0) return rankDelta;
+      return a.localeCompare(b);
+    });
   const applied: string[] = [];
   for (const file of files) {
     const existing = await pool.query(`SELECT 1 FROM schema_migrations WHERE name = $1`, [file]);
