@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, createSign, generateKeyPairSync } from 'node:crypto';
+import { createHash, createHmac, createSign, generateKeyPairSync } from 'node:crypto';
 import { test } from 'node:test';
 import {
   buildAuthorizeUrl,
@@ -119,6 +119,46 @@ test('id_token verification: wrong audience, wrong issuer, expired, bad nonce al
   const other = generateKeyPairSync('rsa', { modulusLength: 2048 });
   const foreign = signIdToken(base, other.privateKey);
   assert.throws(() => verifyIdToken(foreign, options), /signature is invalid/);
+});
+
+test('id_token verification: HS256 (client-secret MAC) is accepted and checked', () => {
+  // Authentik signs with HS256 when a confidential client has no RSA signing key.
+  const secret = 'the-client-secret';
+  const now = Math.floor(Date.now() / 1000);
+  const claims: IdTokenClaims = {
+    iss: discovery.issuer,
+    sub: 'user-uuid-2',
+    aud: 'client-id',
+    exp: now + 300,
+    iat: now,
+    nonce: 'no',
+  };
+  const header = base64url(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const payload = base64url(Buffer.from(JSON.stringify(claims)));
+  const signature = createHmac('sha256', secret).update(`${header}.${payload}`).digest();
+  const token = `${header}.${payload}.${base64url(signature)}`;
+
+  const verified = verifyIdToken(token, {
+    jwks: [],
+    issuer: discovery.issuer,
+    clientId: 'client-id',
+    clientSecret: secret,
+    nonce: 'no',
+  });
+  assert.equal(verified.sub, 'user-uuid-2');
+
+  // The wrong secret is not a login.
+  assert.throws(
+    () =>
+      verifyIdToken(token, {
+        jwks: [],
+        issuer: discovery.issuer,
+        clientId: 'client-id',
+        clientSecret: 'wrong-secret',
+        nonce: 'no',
+      }),
+    /signature is invalid/,
+  );
 });
 
 test('display name falls back down the claim list', () => {

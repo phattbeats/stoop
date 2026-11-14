@@ -89,6 +89,7 @@ export class AuthService {
       jwks,
       issuer: discovery.issuer,
       clientId: this.options.config.clientId,
+      clientSecret: this.options.config.clientSecret,
       nonce: loginState.nonce,
     });
 

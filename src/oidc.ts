@@ -10,7 +10,14 @@
  * exchange and forgets the tokens.
  */
 
-import { createHash, createPublicKey, randomBytes, verify as cryptoVerify } from 'node:crypto';
+import {
+  createHash,
+  createHmac,
+  createPublicKey,
+  randomBytes,
+  timingSafeEqual,
+  verify as cryptoVerify,
+} from 'node:crypto';
 
 export interface OidcConfig {
   issuer: string;
@@ -210,15 +217,26 @@ export async function fetchJwks(discovery: Discovery): Promise<Jwk[]> {
 }
 
 /**
- * Verify an RS256 id_token against the issuer's JWKS.
+ * Verify an id_token against the issuer.
  *
- * Hand-rolled on purpose: the app has exactly one job here and the check is
- * small enough to read. `aud`, `iss`, `exp` and `nonce` are all enforced —
- * an id_token that fails any of them is not a login.
+ * Two signatures are accepted, because this issuer uses both shapes:
+ *   * RS256 — an RSA signing key published in the JWKS.
+ *   * HS256 — a confidential client with no signing key configured; Authentik
+ *     then MACs the token with the client secret (OIDC Core 3.1.3.7).
+ *
+ * `aud`, `iss`, `exp` and `nonce` are enforced in both cases: an id_token that
+ * fails any of them is not a login.
  */
 export function verifyIdToken(
   idToken: string,
-  options: { jwks: Jwk[]; issuer: string; clientId: string; nonce?: string; now?: number },
+  options: {
+    jwks: Jwk[];
+    issuer: string;
+    clientId: string;
+    clientSecret?: string;
+    nonce?: string;
+    now?: number;
+  },
 ): IdTokenClaims {
   const parts = idToken.split('.');
   if (parts.length !== 3) throw new OidcError('id_token is malformed');
@@ -230,16 +248,25 @@ export function verifyIdToken(
   } catch {
     throw new OidcError('id_token header is not JSON');
   }
-  if (header.alg !== 'RS256') throw new OidcError(`unsupported id_token alg: ${header.alg}`);
 
-  const jwk = options.jwks.find((key) => (key.kid ? key.kid === header.kid : true));
-  if (!jwk) throw new OidcError(`no jwk for kid ${header.kid ?? '(none)'}`);
-
-  const publicKey = createPublicKey({ key: jwk as never, format: 'jwk' });
-  const signature = decodeSegment(signaturePart);
   const signed = Buffer.from(`${headerPart}.${payloadPart}`);
-  if (!cryptoVerify('RSA-SHA256', signed, publicKey, signature)) {
-    throw new OidcError('id_token signature is invalid');
+  const signature = decodeSegment(signaturePart);
+
+  if (header.alg === 'RS256') {
+    const jwk = options.jwks.find((key) => (key.kid ? key.kid === header.kid : true));
+    if (!jwk) throw new OidcError(`no jwk for kid ${header.kid ?? '(none)'}`);
+    const publicKey = createPublicKey({ key: jwk as never, format: 'jwk' });
+    if (!cryptoVerify('RSA-SHA256', signed, publicKey, signature)) {
+      throw new OidcError('id_token signature is invalid');
+    }
+  } else if (header.alg === 'HS256') {
+    if (!options.clientSecret) throw new OidcError('HS256 id_token but no client secret to verify it');
+    const expected = createHmac('sha256', options.clientSecret).update(signed).digest();
+    if (expected.length !== signature.length || !timingSafeEqual(expected, signature)) {
+      throw new OidcError('id_token signature is invalid');
+    }
+  } else {
+    throw new OidcError(`unsupported id_token alg: ${header.alg}`);
   }
 
   let claims: IdTokenClaims;
