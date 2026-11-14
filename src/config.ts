@@ -28,6 +28,34 @@ export interface Config {
   photosDir: string;
   /** Etsy, when the app has been given credentials for it. */
   etsy?: EtsyConfig;
+  /** eBay, when the app has been given credentials for it. */
+  ebay?: EbayConfig;
+}
+
+/**
+ * eBay's credentials and the marketplace defaults.
+ *
+ * Optional for the same reason Etsy's block is: without a key the app still
+ * serves everything else. The environment is explicit — sandbox and production
+ * are different hosts with different sellers, and a client that guessed wrong
+ * would publish into the wrong marketplace.
+ */
+export interface EbayConfig {
+  /** The app's client id (eBay's App ID). */
+  clientId: string;
+  /** The app's client secret (eBay's Cert ID). */
+  clientSecret: string;
+  environment: 'sandbox' | 'production';
+  /** The scope requested with a seller token. */
+  scope: string;
+  /** The marketplace id sent on every API call. */
+  marketplaceId: string;
+  /** A seller's refresh token, when there is one. */
+  refreshToken?: string;
+  /** The sandbox or production seller this app publishes as. */
+  sellerUserId?: string;
+  /** Where eBay sends the seller back after consent. */
+  redirectUri: string;
 }
 
 /**
@@ -110,6 +138,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     const shippingProfileId = Number(optional('STOOP_ETSY_SHIPPING_PROFILE_ID', ''));
     if (Number.isFinite(shippingProfileId) && shippingProfileId > 0) etsy.shippingProfileId = shippingProfileId;
     config.etsy = etsy;
+  }
+
+  const ebayClientId = optional('STOOP_EBAY_CLIENT_ID', '');
+  if (ebayClientId) {
+    const ebay: EbayConfig = {
+      clientId: ebayClientId,
+      clientSecret: optional('STOOP_EBAY_CLIENT_SECRET', ''),
+      environment: optional('STOOP_EBAY_ENV', 'sandbox') === 'production' ? 'production' : 'sandbox',
+      scope: optional('STOOP_EBAY_SCOPE', 'https://api.ebay.com/oauth/api_scope'),
+      marketplaceId: optional('STOOP_EBAY_MARKETPLACE_ID', '0'),
+      redirectUri: optional('STOOP_EBAY_REDIRECT_URI', `${publicUrl}/api/ebay/callback`),
+    };
+    const refreshToken = optional('STOOP_EBAY_REFRESH_TOKEN', '');
+    if (refreshToken) ebay.refreshToken = refreshToken;
+    const sellerUserId = optional('STOOP_EBAY_SELLER_USER_ID', '');
+    if (sellerUserId) ebay.sellerUserId = sellerUserId;
+    config.ebay = ebay;
   }
 
   return config;
