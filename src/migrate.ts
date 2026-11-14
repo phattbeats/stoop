@@ -26,7 +26,8 @@ export async function migrate(pool: Pool, log: (message: string) => void = conso
     .sort((a, b) => {
       const rank = (name: string) => {
         const match = /^(\d+)/.exec(name);
-        return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+        // No numeric prefix = base schema = first.
+        return match ? Number(match[1]) : 0;
       };
       const rankDelta = rank(a) - rank(b);
       if (rankDelta !== 0) return rankDelta;
