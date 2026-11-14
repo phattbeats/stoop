@@ -48,8 +48,10 @@ export interface EbayConfig {
   environment: 'sandbox' | 'production';
   /** The scope requested with a seller token. */
   scope: string;
-  /** The marketplace id sent on every API call. */
+  /** The marketplace id sent on every API call (the header form, e.g. '0'). */
   marketplaceId: string;
+  /** The marketplace the offer body names (e.g. 'EBAY_US'). */
+  offerMarketplace?: string;
   /** A seller's refresh token, when there is one. */
   refreshToken?: string;
   /** The sandbox or production seller this app publishes as. */
@@ -159,6 +161,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       environment: optional('STOOP_EBAY_ENV', 'sandbox') === 'production' ? 'production' : 'sandbox',
       scope: optional('STOOP_EBAY_SCOPE', 'https://api.ebay.com/oauth/api_scope'),
       marketplaceId: optional('STOOP_EBAY_MARKETPLACE_ID', '0'),
+      offerMarketplace: optional('STOOP_EBAY_OFFER_MARKETPLACE', 'EBAY_US'),
       redirectUri: optional('STOOP_EBAY_REDIRECT_URI', `${publicUrl}/api/ebay/callback`),
     };
     const refreshToken = optional('STOOP_EBAY_REFRESH_TOKEN', '');

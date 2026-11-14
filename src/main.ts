@@ -90,6 +90,7 @@ if (config.ebay) {
       fulfillmentPolicyId: config.ebay.fulfillmentPolicyId ?? '',
       paymentPolicyId: config.ebay.paymentPolicyId ?? '',
       returnPolicyId: config.ebay.returnPolicyId ?? '',
+      marketplace: config.ebay.offerMarketplace ?? 'EBAY_US',
     },
   );
   adapters.ebay = adapter;

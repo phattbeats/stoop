@@ -50,6 +50,7 @@ const adapterOptions = {
   fulfillmentPolicyId: 'ful-1',
   paymentPolicyId: 'pay-1',
   returnPolicyId: 'ret-1',
+  marketplace: 'EBAY_US',
 };
 
 function adapterWith(
@@ -155,6 +156,40 @@ test('the offer carries the price, the quantity, the marketplace and the categor
   assert.equal(body.marketplaceId, 'EBAY_US');
   assert.equal(body.category.categoryId, '183050');
   assert.equal(body.inventoryItemId, 'inv-1', 'the offer points at the item it was created for');
+});
+
+test('the offer carries a condition and an available quantity, because eBay requires both', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl);
+
+  await adapter.publish(publishRequest({ quantity: 1 }));
+
+  const offerCall = calls.find((c) => c.url.endsWith('/offer') && c.method === 'POST');
+  const body = JSON.parse(String(offerCall?.body));
+  assert.equal(body.condition, 'NEW', 'an offer without a condition is rejected by eBay');
+  assert.equal(body.availableQuantity, 1);
+});
+
+test('the inventory item carries the locale eBay needs on the product', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl);
+
+  await adapter.publish(publishRequest());
+
+  const itemCall = calls.find((c) => c.url.includes('/inventory_items'));
+  const body = JSON.parse(String(itemCall?.body));
+  assert.equal(body.product.locale, 'en-US');
+});
+
+test('the marketplace can be set explicitly and is not guessed', async () => {
+  const { impl, calls } = happyPath();
+  const { adapter } = adapterWith(impl, { marketplace: 'EBAY_GB' });
+
+  await adapter.publish(publishRequest());
+
+  const offerCall = calls.find((c) => c.url.endsWith('/offer') && c.method === 'POST');
+  const body = JSON.parse(String(offerCall?.body));
+  assert.equal(body.marketplaceId, 'EBAY_GB');
 });
 
 test('the listing policies carry the three store policies and turn the offer on', async () => {

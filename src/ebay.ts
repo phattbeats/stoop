@@ -54,8 +54,18 @@ export interface EBayAdapterOptions {
   fulfillmentPolicyId: string;
   paymentPolicyId: string;
   returnPolicyId: string;
-  /** The marketplace the offer is created on. Defaults to EBAY_US. */
-  marketplaceId?: string;
+  /**
+   * The marketplace the offer is created on, in eBay's offer-body form
+   * ('EBAY_US'). This is NOT the same value as the transport's
+   * marketplace header, which is a different id for the same marketplace.
+   */
+  marketplace?: string;
+  /**
+   * The item's condition. eBay will not accept an offer without one; the
+   * seller chooses it per item, and a one-off print that has never been
+   * hung is 'NEW'.
+   */
+  condition?: string;
   /** How many are for sale. Emily sells one of a thing. */
   quantity?: number;
   /** Days the offer stays live when the item sells. */
@@ -125,6 +135,13 @@ export class EBayAdapter implements MarketplaceAdapter {
 
     const accessToken = await this.tokens.accessToken();
 
+    const quantity = this.options.quantity ?? 1;
+    const marketplace = this.options.marketplace ?? 'EBAY_US';
+    // eBay rejects an offer without a condition, and it is a fact about the
+    // item, not a default. An original print that was never displayed is
+    // 'NEW'; anything she has had up is 'USED_EXCELLENT' at best.
+    const condition = this.options.condition?.trim() || 'NEW';
+
     // 1. The inventory item — what the thing is. Created first because the
     //    offer references it by id.
     const sku = EBayAdapter.skuFor(request.itemId);
@@ -142,6 +159,8 @@ export class EBayAdapter implements MarketplaceAdapter {
             imageUrls: [],
             inventoryLocationId: this.options.inventoryLocationId,
             sellerSKU: sku,
+            // eBay needs the locale on the product, not on the offer.
+            locale: 'en-US',
           },
         }),
       },
@@ -165,12 +184,14 @@ export class EBayAdapter implements MarketplaceAdapter {
       body: JSON.stringify({
         format: 'FIXED_PRICE',
         inventoryItemId,
-        marketplaceId: this.options.marketplaceId ?? 'EBAY_US',
+        marketplaceId: marketplace,
         category: { categoryId },
         listingDescription: request.description.trim().slice(0, 1000),
+        condition,
+        availableQuantity: quantity,
         pricingSummary: {
           price: { value: request.priceCents / 100, currency: 'USD' },
-          quantity: request.quantity ?? 1,
+          quantity,
         },
       }),
     });
