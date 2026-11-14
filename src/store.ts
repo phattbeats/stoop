@@ -198,7 +198,7 @@ export class PgLedger {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const item = await this.getItem(client, itemId);
+      const item = await this.fetchItem(client, itemId);
       if (!item) throw new Error(`unknown item ${itemId}`);
       assertPublishable(item);
 
@@ -280,7 +280,7 @@ export class PgLedger {
     try {
       await client.query('BEGIN');
 
-      const item = await this.getItem(client, signal.itemId);
+      const item = await this.fetchItem(client, signal.itemId);
       if (!item) throw new Error(`unknown item ${signal.itemId}`);
 
       // A redelivered webhook (Etsy retries) changes nothing.
@@ -424,7 +424,7 @@ export class PgLedger {
     }
   }
 
-  private async getItem(client: PoolClient, itemId: string): Promise<Item | undefined> {
+  private async fetchItem(client: PoolClient, itemId: string): Promise<Item | undefined> {
     const result = await client.query<ItemRow>(
       `SELECT id, seller_id, title, description, price_cents, photos, tags, status, created_at
          FROM items WHERE id = $1`,
