@@ -37,7 +37,7 @@ integration('the Postgres store keeps the same invariants as the in-memory ledge
     tags: ['Print', 'print', 'art'],
   });
   assert.equal(item.status, 'draft');
-  assert.deepEqual(item.tags, ['print'], 'tags are normalized and de-duped');
+  assert.deepEqual(item.tags, ['print', 'art'], 'tags are normalized and de-duped');
 
   const refItem = reference.createItem({
     sellerId: seller.id,
