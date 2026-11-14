@@ -270,29 +270,34 @@ async function readLocalImage(
  * The marketplaces an item can be published to, from the phone's point of
  * view.
  *
- * Two questions per marketplace: is it configured, and is this item allowed
- * on it? The second one is the marketplace's own rule — Etsy is
- * original/vintage only — and it is enforced here so the phone does not
- * offer a button that is going to be refused.
+ * A marketplace has three states and the phone shows a different thing for
+ * each:
  *
- * A marketplace that is not configured is not shown at all. A button that
- * always fails is worse than no button.
+ *   * not configured — nothing at all. A button that always fails is worse
+ *     than no button.
+ *   * configured, not connected — a "connect" link, because Emily consents
+ *     to the marketplace herself and this is how she gets there.
+ *   * connected — publish buttons, one per marketplace.
+ *
+ * The item's own rule is applied before a button is offered: Etsy is
+ * original/vintage only, and the phone should not offer a button that is
+ * going to be refused.
  */
 function publishableFor(
   item: { id: string; originalOrVintage: boolean | null; status: string },
   listings: { marketplace: string; state: string }[],
-  adapters: { ebay?: unknown; etsy?: unknown },
+  status: { ebay?: boolean; etsy?: boolean },
 ): { marketplace: string; published: boolean; eligible: boolean; reason?: string }[] {
   const out: { marketplace: string; published: boolean; eligible: boolean; reason?: string }[] = [];
 
-  if (adapters.ebay) {
+  if (status.ebay) {
     out.push({
       marketplace: 'ebay',
       published: listings.some((l) => l.marketplace === 'ebay' && l.state === 'live'),
       eligible: true,
     });
   }
-  if (adapters.etsy) {
+  if (status.etsy) {
     // Etsy's rule, applied before the button is offered.
     const eligible = item.originalOrVintage === true;
     out.push({
@@ -362,6 +367,29 @@ export function createApp(options: ServerOptions): {
       displayName: session.displayName,
     });
     return seller.id;
+  };
+
+  /**
+   * Is a marketplace connected for this seller?
+   *
+   * Connecting is Emily's own act, so the phone has to tell her when it
+   * still has to happen — and give her the link to do it.
+   */
+  const ebayConnected = async (sellerId: string): Promise<boolean> => {
+    if (!ebayService) return false;
+    try {
+      return await ebayService.isConnected(sellerId);
+    } catch {
+      return false;
+    }
+  };
+  const etsyConnected = async (sellerId: string): Promise<boolean> => {
+    if (!etsy) return false;
+    try {
+      return await etsy.isConnected(sellerId);
+    } catch {
+      return false;
+    }
   };
 
   const server = createServer(async (req, res) => {
@@ -522,7 +550,10 @@ export function createApp(options: ServerOptions): {
               ),
               card: facebookCardFor(item),
               listings: itemListings.map((l) => ({ marketplace: l.marketplace, state: l.state })),
-              publishable: publishableFor(item, itemListings, { ebay, etsy }),
+              publishable: publishableFor(item, itemListings, {
+                ebay: (await ebayConnected(sellerId)) || undefined,
+                etsy: (await etsyConnected(sellerId)) || undefined,
+              }),
             };
           }),
         );
@@ -533,9 +564,20 @@ export function createApp(options: ServerOptions): {
         // ended on the other marketplace. A queue nobody can see is not
         // surfaced, it is just lost.
         const openActions = remoteActions ? await remoteActions.listOpen() : [];
+        // A marketplace that is set up but not yet connected to Emily's own
+        // account. She has to consent herself, so the phone offers the link
+        // rather than pretending the account is ready.
+        const connections: { marketplace: string; name: string }[] = [];
+        if (ebayService && !(await ebayConnected(sellerId))) {
+          connections.push({ marketplace: 'ebay', name: 'eBay' });
+        }
+        if (etsy && !(await etsyConnected(sellerId))) {
+          connections.push({ marketplace: 'etsy', name: 'Etsy' });
+        }
         const html = renderShell({
           displayName: session.displayName,
           items,
+          connections,
           actions: openActions
             .filter((action) => action.needsHuman)
             .map((action) => ({

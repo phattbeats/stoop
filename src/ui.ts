@@ -132,8 +132,35 @@ export function renderShell(options: {
   drafts?: PendingDraft[];
   /** Things only a human can finish: a listing that has to be ended by hand. */
   actions?: ActionView[];
+  /**
+   * Marketplaces that are set up but not connected to Emily's own account.
+   * She consents to them herself, so the phone offers the link rather than
+   * pretending the account is ready.
+   */
+  connections?: { marketplace: string; name: string }[];
 }): string {
-  const { displayName, items, drafts = [], actions = [] } = options;
+  const { displayName, items, drafts = [], actions = [], connections = [] } = options;
+
+  const connectCards = connections.length
+    ? `<section class="connections">
+      <h2>Connect your accounts</h2>
+      <ul>
+      ${connections
+        .map(
+          (connection) => `<li class="connection">
+          <p class="title">${escapeHtml(connection.name)}</p>
+          <p class="meta-line">You connect ${escapeHtml(
+            connection.name,
+          )} yourself, on ${escapeHtml(connection.name)}'s own screen.</p>
+          <a class="connect-link" href="/api/${escapeHtml(connection.marketplace)}/connect">Connect ${escapeHtml(
+            connection.name,
+          )}</a>
+        </li>`,
+        )
+        .join('\n')}
+      </ul>
+    </section>`
+    : '';
 
   const actionCards = actions
     .map(
@@ -264,6 +291,15 @@ export function renderShell(options: {
   .badge.fb { background:#1877f222; color:#79c0ff; }
   .badge.refund { background:#d2992222; color:#d29922; }
   section.actions { margin: 4px 12px 18px; }
+  section.connections { margin: 4px 12px 18px; }
+  section.connections h2 { font-size: 17px; margin: 10px 4px 6px; color: var(--dim);
+                          text-transform: uppercase; letter-spacing:.6px; }
+  section.connections ul { list-style:none; margin:0; padding:0; }
+  li.connection { background:var(--card); border-radius:14px; padding:12px; margin-bottom:10px;
+                  border-left:3px solid var(--accent); }
+  a.connect-link { display:block; margin-top:10px; padding:14px; border-radius:12px;
+                   background:var(--accent); color:#06210d; font-weight:600; text-align:center;
+                   text-decoration:none; }
   section.actions h2 { font-size: 17px; margin: 10px 4px 6px; color: #d29922;
                        text-transform: uppercase; letter-spacing:.6px; }
   section.actions ul { list-style:none; margin:0; padding:0; }
@@ -308,6 +344,7 @@ export function renderShell(options: {
   <h1>Stoop</h1>
   <p>${escapeHtml(displayName)} — ${items.length} item${items.length === 1 ? '' : 's'}</p>
 </header>
+${connectCards}
 <ul>
 ${rows || '<li class="empty">Nothing here yet. Photograph something.</li>'}
 </ul>

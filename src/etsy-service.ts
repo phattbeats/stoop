@@ -134,6 +134,17 @@ export class EtsyService {
     return shopId ? { shopId } : {};
   }
 
+  /**
+   * Is a seller connected to Etsy?
+   *
+   * The phone needs this: a publish button for an account that was never
+   * connected is a button that always fails.
+   */
+  async isConnected(sellerId: string): Promise<boolean> {
+    const stored = await this.options.tokenStore.get(sellerId);
+    return Boolean(stored);
+  }
+
   /** Publish an item on Etsy. */
   async publishListing(input: EtsyPublishInput): Promise<PublishResult> {
     const taxonomyId = input.taxonomyId ?? this.options.taxonomyId;

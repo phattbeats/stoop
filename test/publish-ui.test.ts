@@ -17,13 +17,20 @@ const sessions: Record<string, Session> = {
 };
 
 async function withServer(
-  options: { ebay?: unknown; etsy?: unknown },
+  options: { ebay?: unknown; etsy?: unknown; ebayConnected?: boolean },
   run: (ctx: { base: string; close: () => Promise<void>; cookie: string }) => Promise<void>,
 ): Promise<void> {
   const { server } = createApp({
     verifySession: (token) => (token ? sessions[token] ?? null : null),
     ...(options.ebay ? { ebay: options.ebay as never } : {}),
     ...(options.etsy ? { etsy: options.etsy as never } : {}),
+    ...(options.ebay
+      ? {
+          ebayService: {
+            isConnected: async () => options.ebayConnected !== false,
+          } as never,
+        }
+      : {}),
   });
   const { port, close } = await listen(server);
   try {
@@ -41,6 +48,14 @@ function fakeAdapter(marketplace: 'ebay' | 'etsy') {
     },
     async end(_remoteId: string): Promise<EndResult> {
       return { ended: true };
+    },
+    // The Etsy service is both the publisher and the one that knows whether
+    // the account is connected.
+    async isConnected(_sellerId: string): Promise<boolean> {
+      return true;
+    },
+    async publishListing(_request: PublishRequest): Promise<PublishResult> {
+      return { remoteId: `${marketplace}-1` };
     },
   };
 }
@@ -208,6 +223,31 @@ test('a refused publish tells Emily why, instead of a bare failure', async () =>
     assert.equal(res.status, 400);
     const body = (await res.json()) as { error: string; detail: string };
     assert.match(body.detail, /DRAFT/);
+    await close();
+  });
+});
+
+test('a marketplace that is set up but not connected offers the connect link', async () => {
+  await withServer({ ebay: fakeAdapter('ebay'), ebayConnected: false }, async ({ base, close, cookie }) => {
+    const page = await fetch(base, { headers: { cookie } });
+    const html = await page.text();
+
+    // Emily consents to eBay herself, so the phone has to give her the way
+    // there.
+    assert.match(html, /href="\/api\/ebay\/connect"/);
+    assert.match(html, /Connect eBay/);
+    // And no publish button, because publishing would fail.
+    assert.ok(!html.includes('data-marketplace="ebay"'));
+    await close();
+  });
+});
+
+test('a connected marketplace offers no connect link', async () => {
+  await withServer({ ebay: fakeAdapter('ebay'), ebayConnected: true }, async ({ base, close, cookie }) => {
+    const page = await fetch(base, { headers: { cookie } });
+    const html = await page.text();
+
+    assert.ok(!html.includes('href="/api/ebay/connect"'));
     await close();
   });
 });
